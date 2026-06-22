@@ -510,6 +510,21 @@ def inventory_summary(warehouse_date: Optional[str] = None,
             "warehouse_date": warehouse_date}
 
 
+@router.post("/inventory/clean-expired")
+def clean_expired_reservations(db: Session = Depends(get_db)):
+    try:
+        service = InventoryService(db)
+        result = service.clean_all_expired_reservations()
+        db.commit()
+        return {
+            "data": result,
+            "message": f"清理完成：取消订单 {result['cancelled_orders']} 个，释放锁定 {result['cleaned_reservations']} 条"
+        }
+    except Exception as e:
+        db.rollback()
+        raise HTTPException(500, f"清理失败: {str(e)}")
+
+
 @router.get("/dashboard/stats")
 def dashboard_stats(db: Session = Depends(get_db)):
     warehouse_date = get_today_warehouse_date()

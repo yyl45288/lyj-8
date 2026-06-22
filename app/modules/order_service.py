@@ -85,9 +85,6 @@ class OrderService:
             {"product_id": it["product_id"], "qty": it["qty"]}
             for it in items
         ]
-        success, errors = self.inventory.check_stock(inventory_items, warehouse_date)
-        if not success:
-            raise InventoryInsufficientError("库存不足: " + "; ".join(errors))
 
         price_result = self.pricing.calculate_price(
             items=items,
