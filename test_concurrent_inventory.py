@@ -19,7 +19,7 @@ from app.models import (
     Inventory, InventoryReservation
 )
 from app.modules.inventory import InventoryService, InventoryInsufficientError
-from app.modules.order_service import OrderService
+from app.modules.order_service import OrderService, OrderStateError
 
 PASS = "[PASS]"
 FAIL = "[FAIL]"
@@ -473,6 +473,84 @@ def test_inventory_lock_release_flow():
             if order4_refreshed.status != OrderStatus.CANCELLED:
                 issues.append(f"Expired order not cancelled: status={order4_refreshed.status.value}")
                 test_passed = False
+
+            print("\nStep 6: Block payment on expired order (auto cancel + release)")
+            order5, _ = order_service.create_order(
+                user_id=TEST_USER_BASE + 4,
+                leader_id=TEST_LEADER_ID,
+                warehouse_date=WAREHOUSE_DATE,
+                items=[{"product_id": TEST_PRODUCT_ID, "qty": 2}]
+            )
+            db.commit()
+
+            inv = inv_service.get_or_create_inventory(TEST_PRODUCT_ID, WAREHOUSE_DATE)
+            print(f"  Created order #{order5.id}, qty 2 (unpaid)")
+            print(f"  Reserved before expire: {inv.reserved_qty}")
+
+            reservations5 = db.query(InventoryReservation).filter(
+                InventoryReservation.order_id == order5.id
+            ).all()
+            for r in reservations5:
+                r.expires_at = datetime.utcnow() - timedelta(minutes=30)
+            db.commit()
+            print(f"  Set order #{order5.id} reservation expire to 30 minutes ago (directly expire)")
+
+            pay_blocked = False
+            pay_error_msg = None
+            try:
+                order_service.pay_order(order5.id)
+                db.commit()
+            except OrderStateError as e:
+                pay_blocked = True
+                pay_error_msg = str(e)
+                db.rollback()
+            except Exception as e:
+                pay_error_msg = f"Unexpected error: {e}"
+                db.rollback()
+
+            inv_after = inv_service.get_or_create_inventory(TEST_PRODUCT_ID, WAREHOUSE_DATE)
+            order5_after = db.query(Order).filter(Order.id == order5.id).first()
+            reservations5_after = db.query(InventoryReservation).filter(
+                InventoryReservation.order_id == order5.id
+            ).all()
+            active_reservations5 = [r for r in reservations5_after if r.is_active]
+
+            print(f"  Payment blocked: {pay_blocked}")
+            if pay_error_msg:
+                print(f"  Error message: {pay_error_msg[:80]}..." if len(pay_error_msg) > 80 else f"  Error message: {pay_error_msg}")
+            print(f"  Order status after pay attempt: {order5_after.status.value}")
+            print(f"  Inventory reserved: {inv_after.reserved_qty} (should be 0)")
+            print(f"  Active reservations for order: {len(active_reservations5)} (should be 0)")
+
+            if not pay_blocked:
+                issues.append("Payment NOT blocked for expired order (should throw OrderStateError)")
+                test_passed = False
+            else:
+                print(f"{OK} Payment correctly blocked for expired order")
+
+            if order5_after.status != OrderStatus.CANCELLED:
+                issues.append(
+                    f"Expired order not auto-cancelled on pay attempt. "
+                    f"Status: {order5_after.status.value} (should be cancelled)"
+                )
+                test_passed = False
+            else:
+                print(f"{OK} Order auto-cancelled on expired pay attempt")
+
+            if inv_after.reserved_qty != 0:
+                issues.append(
+                    f"Reserved qty not released on expired pay block: "
+                    f"reserved={inv_after.reserved_qty} (should be 0)"
+                )
+                test_passed = False
+            else:
+                print(f"{OK} Reserved qty correctly released on expired pay block")
+
+            if active_reservations5:
+                issues.append(f"Still {len(active_reservations5)} active reservations (should be 0)")
+                test_passed = False
+            else:
+                print(f"{OK} All reservations marked inactive after expired pay-block")
 
             print()
             if test_passed:

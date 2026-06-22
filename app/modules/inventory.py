@@ -306,36 +306,76 @@ class InventoryService:
 
     def clean_all_expired_reservations(self) -> Dict:
         now = datetime.utcnow()
-        expired_orders = self.db.query(Order).filter(
-            Order.status == OrderStatus.CREATED,
-            Order.payment_status == PaymentStatus.UNPAID,
-            Order.id.in_(
-                select(InventoryReservation.order_id).where(
-                    InventoryReservation.is_active == True,
-                    InventoryReservation.expires_at < now
-                )
+        from app.models import OrderStatus, PaymentStatus
+
+        expired_order_ids_stmt = (
+            select(InventoryReservation.order_id)
+            .where(
+                InventoryReservation.is_active == True,
+                InventoryReservation.expires_at < now,
+                InventoryReservation.order_id.isnot(None)
             )
-        ).all()
+            .distinct()
+        )
+        expired_order_ids = [r[0] for r in self.db.execute(expired_order_ids_stmt).all()]
 
         cancelled_count = 0
-        for order in expired_orders:
+        for oid in expired_order_ids:
             try:
-                from app.modules.order_service import OrderService
-                order_service = OrderService(self.db)
-                order_service.cancel_order(
-                    order.id,
-                    operator="system",
-                    reason="订单超时未支付，自动取消"
-                )
-                cancelled_count += 1
+                with self.db.begin_nested():
+                    order = self.db.query(Order).filter(
+                        Order.id == oid,
+                        Order.status == OrderStatus.CREATED,
+                        Order.payment_status == PaymentStatus.UNPAID
+                    ).first()
+                    if not order:
+                        continue
+                    from app.modules.order_service import OrderService
+                    order_service = OrderService(self.db)
+                    order_service.cancel_order(
+                        order.id,
+                        operator="system",
+                        reason="订单超时未支付，自动取消"
+                    )
+                    cancelled_count += 1
             except Exception:
-                self.db.rollback()
                 continue
 
         cleaned_count = 0
         all_warehouse_dates = self.db.query(Inventory.warehouse_date).distinct().all()
         for (wd,) in all_warehouse_dates:
             cleaned_count += self._clean_expired_reservations(wd)
+
+        dangling = self.db.query(InventoryReservation).filter(
+            InventoryReservation.is_active == True,
+            InventoryReservation.expires_at < now
+        ).filter(
+            ~InventoryReservation.order_id.in_(
+                select(Order.id).where(Order.status == OrderStatus.CREATED)
+            )
+        ).all()
+        if dangling:
+            sorted_dangling = sorted(dangling, key=lambda r: (r.product_id, r.id))
+            for res in sorted_dangling:
+                inv = self.db.query(Inventory).filter(
+                    Inventory.product_id == res.product_id,
+                    Inventory.warehouse_date == res.warehouse_date
+                ).first()
+                if inv:
+                    release = min(res.qty, inv.reserved_qty)
+                    if release > 0:
+                        stmt = (
+                            update(Inventory)
+                            .where(and_(
+                                Inventory.id == inv.id,
+                                Inventory.reserved_qty >= release
+                            ))
+                            .values(reserved_qty=Inventory.reserved_qty - release)
+                            .execution_options(synchronize_session="fetch")
+                        )
+                        self.db.execute(stmt)
+                res.is_active = False
+                cleaned_count += 1
 
         self.db.flush()
         return {

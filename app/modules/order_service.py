@@ -142,6 +142,29 @@ class OrderService:
         if not self._validate_transition(order.status, OrderStatus.PAID):
             raise OrderStateError(f"订单状态 {order.status.value} 不允许支付")
 
+        if order.status == OrderStatus.CREATED and order.payment_status == PaymentStatus.UNPAID:
+            now = datetime.utcnow()
+            first_reservation = self.db.query(InventoryReservation).filter(
+                InventoryReservation.order_id == order_id,
+                InventoryReservation.is_active == True
+            ).order_by(InventoryReservation.expires_at.asc()).first()
+
+            if first_reservation and first_reservation.expires_at and first_reservation.expires_at < now:
+                from datetime import timedelta as _td
+                expired_minutes = int((now - first_reservation.expires_at).total_seconds() / 60)
+                try:
+                    with self.db.begin_nested():
+                        self.cancel_order(
+                            order.id,
+                            operator="system",
+                            reason=f"支付时发现订单已过期（超时{expired_minutes}分钟），自动取消"
+                        )
+                except Exception:
+                    pass
+                raise OrderStateError(
+                    f"订单已过期（超时{expired_minutes}分钟），无法支付，已自动取消并释放锁定库存"
+                )
+
         self.inventory.confirm_reservations(order.id, order.warehouse_date)
 
         if order.coupon_id:

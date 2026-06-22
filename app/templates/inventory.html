@@ -10,6 +10,7 @@
         <h3>📋 今日库存总览</h3>
         <div style="display:flex;gap:8px;align-items:center">
             <span id="inv-date" class="badge badge-blue">加载中</span>
+            <button class="btn btn-warning btn-sm" onclick="cleanExpired()">🧹 清理过期订单</button>
             <button class="btn btn-primary btn-sm" onclick="loadInventory()">🔄 刷新</button>
         </div>
     </div>
@@ -124,6 +125,26 @@ async function restock(productId, productName) {
 
     showToast('操作成功，建议在下次截单前确保库存充足', 'success');
     loadInventory();
+}
+
+async function cleanExpired() {
+    if (!confirm('确定清理所有过期未支付订单并释放锁定库存？')) return;
+    try {
+        const res = await fetch('/api/inventory/clean-expired', { method: 'POST' });
+        const result = await res.json();
+        if (res.ok && result.data) {
+            const d = result.data;
+            showToast(
+                `清理完成：取消 ${d.cancelled_orders} 个过期订单，释放 ${d.cleaned_reservations} 条库存锁定`,
+                'success'
+            );
+            loadInventory();
+        } else {
+            showToast(result.message || '清理失败', 'error');
+        }
+    } catch (e) {
+        showToast('清理请求失败: ' + e.message, 'error');
+    }
 }
 
 loadInventory();
