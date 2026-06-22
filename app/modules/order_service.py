@@ -1,13 +1,17 @@
 from datetime import datetime
 from sqlalchemy.orm import Session
 from app.models import (
-    Order, OrderItem, OrderStatusLog, OrderStatus, PaymentStatus,
+    Order, OrderItem, OrderStatus, PaymentStatus,
     Product, User, Leader, SortingTask, SortingItem, SortingStatus,
-    UserCoupon, InventoryReservation, AfterSale, AfterSaleItem,
-    AfterSaleStatus
+    AfterSale, AfterSaleItem, AfterSaleStatus
 )
 from app.modules.inventory import InventoryService, InventoryInsufficientError
 from app.modules.pricing import PricingService, CouponEngine
+from app.modules.order_state_machine import OrderStateMachine, StateTransitionError
+from app.modules.side_effect_registry import SideEffectRegistry
+from app.modules.side_effects import (
+    SideEffectError, ReservationExpirySideEffectHandler
+)
 from typing import List, Dict, Optional, Tuple
 import uuid
 import random
@@ -17,20 +21,7 @@ class OrderStateError(Exception):
     pass
 
 
-STATE_TRANSITIONS = {
-    OrderStatus.CREATED: [OrderStatus.PAID, OrderStatus.CANCELLED],
-    OrderStatus.PAID: [OrderStatus.CUTOFF, OrderStatus.CANCELLED, OrderStatus.REFUNDING],
-    OrderStatus.CUTOFF: [OrderStatus.SORTING, OrderStatus.REFUNDING],
-    OrderStatus.SORTING: [OrderStatus.SORTED],
-    OrderStatus.SORTED: [OrderStatus.DELIVERING],
-    OrderStatus.DELIVERING: [OrderStatus.DELIVERED],
-    OrderStatus.DELIVERED: [OrderStatus.PICKED_UP],
-    OrderStatus.PICKED_UP: [OrderStatus.COMPLETED],
-    OrderStatus.REFUNDING: [OrderStatus.REFUNDED, OrderStatus.PAID],
-    OrderStatus.REFUNDED: [],
-    OrderStatus.CANCELLED: [],
-    OrderStatus.COMPLETED: [],
-}
+STATE_TRANSITIONS = OrderStateMachine.STATE_TRANSITIONS
 
 
 class OrderService:
@@ -39,6 +30,9 @@ class OrderService:
         self.inventory = InventoryService(db)
         self.pricing = PricingService(db)
         self.coupon_engine = CouponEngine(db)
+        self.registry = SideEffectRegistry(db)
+        self.state_machine = self.registry.state_machine
+        self._reservation_checker = ReservationExpirySideEffectHandler(db)
 
     def _generate_order_no(self) -> str:
         now = datetime.now()
@@ -46,20 +40,8 @@ class OrderService:
         random_part = str(random.randint(1000, 9999))
         return f"CG{date_part}{random_part}"
 
-    def _log_status_change(self, order: Order, from_status: Optional[str], to_status: str,
-                           operator: str = "system", remark: str = None):
-        log = OrderStatusLog(
-            order_id=order.id,
-            from_status=from_status,
-            to_status=to_status,
-            operator=operator,
-            remark=remark
-        )
-        self.db.add(log)
-
     def _validate_transition(self, current: OrderStatus, target: OrderStatus) -> bool:
-        allowed = STATE_TRANSITIONS.get(current, [])
-        return target in allowed
+        return self.state_machine.validate_transition(current, target)
 
     def create_order(self, user_id: int, leader_id: int, warehouse_date: str,
                      items: List[Dict], user_coupon_id: int = None,
@@ -128,11 +110,21 @@ class OrderService:
 
         self.inventory.reserve(order.id, inventory_items, warehouse_date)
 
-        self._log_status_change(order, None, OrderStatus.CREATED.value,
-                                remark="订单创建")
+        self._log_initial_status(order, remark="订单创建")
 
         self.db.flush()
         return order, price_result
+
+    def _log_initial_status(self, order: Order, remark: str = None):
+        from app.models import OrderStatusLog
+        log = OrderStatusLog(
+            order_id=order.id,
+            from_status=None,
+            to_status=OrderStatus.CREATED.value,
+            operator="system",
+            remark=remark
+        )
+        self.db.add(log)
 
     def pay_order(self, order_id: int) -> Order:
         order = self.db.query(Order).filter(Order.id == order_id).first()
@@ -143,41 +135,27 @@ class OrderService:
             raise OrderStateError(f"订单状态 {order.status.value} 不允许支付")
 
         if order.status == OrderStatus.CREATED and order.payment_status == PaymentStatus.UNPAID:
-            now = datetime.utcnow()
-            first_reservation = self.db.query(InventoryReservation).filter(
-                InventoryReservation.order_id == order_id,
-                InventoryReservation.is_active == True
-            ).order_by(InventoryReservation.expires_at.asc()).first()
-
-            if first_reservation and first_reservation.expires_at and first_reservation.expires_at < now:
-                from datetime import timedelta as _td
-                expired_minutes = int((now - first_reservation.expires_at).total_seconds() / 60)
+            try:
+                self._reservation_checker.check_and_cancel_expired(order_id)
+            except SideEffectError as see:
                 try:
                     with self.db.begin_nested():
                         self.cancel_order(
                             order.id,
                             operator="system",
-                            reason=f"支付时发现订单已过期（超时{expired_minutes}分钟），自动取消"
+                            reason=str(see).split("，无法支付")[0].replace("订单已过期", "支付时发现订单已过期")
                         )
                 except Exception:
                     pass
-                raise OrderStateError(
-                    f"订单已过期（超时{expired_minutes}分钟），无法支付，已自动取消并释放锁定库存"
-                )
+                raise OrderStateError(str(see))
 
-        self.inventory.confirm_reservations(order.id, order.warehouse_date)
-
-        if order.coupon_id:
-            self.coupon_engine.mark_coupon_used(order.coupon_id, order.id)
-
-        old_status = order.status.value
-        order.status = OrderStatus.PAID
-        order.payment_status = PaymentStatus.PAID
-        order.paid_amount = order.order_amount
-        order.paid_at = datetime.utcnow()
-
-        self._log_status_change(order, old_status, OrderStatus.PAID.value,
-                                remark="用户支付成功")
+        try:
+            self.state_machine.transition(
+                order, OrderStatus.PAID,
+                operator="system", remark="用户支付成功"
+            )
+        except StateTransitionError as e:
+            raise OrderStateError(str(e))
 
         self.db.flush()
         return order
@@ -191,33 +169,33 @@ class OrderService:
         if not self._validate_transition(order.status, OrderStatus.CANCELLED):
             raise OrderStateError(f"订单状态 {order.status.value} 不允许取消")
 
-        if order.status == OrderStatus.PAID:
-            self.inventory.return_stock(
-                [{"product_id": it.product_id, "qty": it.qty} for it in order.items],
-                order.warehouse_date
+        was_paid = order.paid_amount > 0
+
+        try:
+            self.state_machine.transition(
+                order, OrderStatus.CANCELLED,
+                operator=operator,
+                remark=reason or "订单取消"
             )
-            if order.coupon_id:
-                self.coupon_engine.unmark_coupon_used(order.coupon_id)
-        else:
-            self.inventory.release_reservations(order.id, order.warehouse_date)
+        except StateTransitionError as e:
+            raise OrderStateError(str(e))
 
-        old_status = order.status.value
-        order.status = OrderStatus.CANCELLED
-        order.payment_status = PaymentStatus.REFUNDING if order.paid_amount > 0 else PaymentStatus.UNPAID
-        order.cancelled_at = datetime.utcnow()
-
-        self._log_status_change(order, old_status, OrderStatus.CANCELLED.value,
-                                operator=operator,
-                                remark=reason or "订单取消")
-
-        if order.paid_amount > 0:
-            order.payment_status = PaymentStatus.REFUNDED
-            self._log_status_change(order, OrderStatus.CANCELLED.value, "refunded",
-                                    operator="system",
-                                    remark="退款完成")
+        if was_paid:
+            self._log_cancel_refund(order, operator)
 
         self.db.flush()
         return order
+
+    def _log_cancel_refund(self, order: Order, operator: str):
+        from app.models import OrderStatusLog
+        log = OrderStatusLog(
+            order_id=order.id,
+            from_status=OrderStatus.CANCELLED.value,
+            to_status="refunded",
+            operator="system",
+            remark="退款完成"
+        )
+        self.db.add(log)
 
     def cutoff_orders(self, warehouse_date: str, operator: str = "system") -> List[Order]:
         orders = self.db.query(Order).filter(
@@ -230,42 +208,18 @@ class OrderService:
             if not self._validate_transition(order.status, OrderStatus.CUTOFF):
                 continue
 
-            old_status = order.status.value
-            order.status = OrderStatus.CUTOFF
-            order.cutoff_at = datetime.utcnow()
-
-            self._create_sorting_task(order)
-
-            self._log_status_change(order, old_status, OrderStatus.CUTOFF.value,
-                                    operator=operator,
-                                    remark="截单完成")
-            processed.append(order)
+            try:
+                self.state_machine.transition(
+                    order, OrderStatus.CUTOFF,
+                    operator=operator,
+                    remark="截单完成"
+                )
+                processed.append(order)
+            except StateTransitionError:
+                continue
 
         self.db.flush()
         return processed
-
-    def _create_sorting_task(self, order: Order):
-        task = SortingTask(
-            warehouse_date=order.warehouse_date,
-            order_id=order.id,
-            leader_id=order.leader_id,
-            status=SortingStatus.PENDING,
-            total_items=sum(it.qty for it in order.items),
-            sorted_items=0
-        )
-        self.db.add(task)
-        self.db.flush()
-
-        for item in order.items:
-            si = SortingItem(
-                task_id=task.id,
-                product_id=item.product_id,
-                product_name=item.product_name,
-                required_qty=item.qty,
-                sorted_qty=0,
-                is_complete=False
-            )
-            self.db.add(si)
 
     def start_sorting(self, task_id: int, operator: str = "sorter") -> SortingTask:
         task = self.db.query(SortingTask).filter(SortingTask.id == task_id).first()
@@ -278,15 +232,15 @@ class OrderService:
         if not self._validate_transition(order.status, OrderStatus.SORTING):
             raise OrderStateError(f"订单状态 {order.status.value} 不允许分拣")
 
-        old_order_status = order.status.value
-        order.status = OrderStatus.SORTING
-
-        task.status = SortingStatus.IN_PROGRESS
-        task.started_at = datetime.utcnow()
-        task.operator = operator
-
-        self._log_status_change(order, old_order_status, OrderStatus.SORTING.value,
-                                operator=operator, remark="开始分拣")
+        try:
+            self.state_machine.transition(
+                order, OrderStatus.SORTING,
+                operator=operator,
+                remark="开始分拣",
+                extra={"task_id": task_id}
+            )
+        except StateTransitionError as e:
+            raise OrderStateError(str(e))
 
         self.db.flush()
         return task
@@ -325,17 +279,15 @@ class OrderService:
         if not self._validate_transition(order.status, OrderStatus.SORTED):
             raise OrderStateError(f"订单状态 {order.status.value} 不允许完成分拣")
 
-        old_order_status = order.status.value
-        order.status = OrderStatus.SORTED
-
-        task.status = SortingStatus.COMPLETED
-        task.completed_at = datetime.utcnow()
-
-        for item in task.items:
-            self.inventory.mark_sorted(item.product_id, task.warehouse_date, item.required_qty)
-
-        self._log_status_change(order, old_order_status, OrderStatus.SORTED.value,
-                                operator=operator, remark="分拣完成")
+        try:
+            self.state_machine.transition(
+                order, OrderStatus.SORTED,
+                operator=operator,
+                remark="分拣完成",
+                extra={"task_id": task_id}
+            )
+        except StateTransitionError as e:
+            raise OrderStateError(str(e))
 
         self.db.flush()
         return task
@@ -347,11 +299,13 @@ class OrderService:
         if not self._validate_transition(order.status, OrderStatus.DELIVERING):
             raise OrderStateError(f"订单状态 {order.status.value} 不允许配送")
 
-        old_status = order.status.value
-        order.status = OrderStatus.DELIVERING
-
-        self._log_status_change(order, old_status, OrderStatus.DELIVERING.value,
-                                operator=operator, remark="开始配送")
+        try:
+            self.state_machine.transition(
+                order, OrderStatus.DELIVERING,
+                operator=operator, remark="开始配送"
+            )
+        except StateTransitionError as e:
+            raise OrderStateError(str(e))
 
         self.db.flush()
         return order
@@ -363,12 +317,13 @@ class OrderService:
         if not self._validate_transition(order.status, OrderStatus.DELIVERED):
             raise OrderStateError(f"订单状态 {order.status.value} 不允许签收")
 
-        old_status = order.status.value
-        order.status = OrderStatus.DELIVERED
-        order.delivered_at = datetime.utcnow()
-
-        self._log_status_change(order, old_status, OrderStatus.DELIVERED.value,
-                                operator=operator, remark="团长签收")
+        try:
+            self.state_machine.transition(
+                order, OrderStatus.DELIVERED,
+                operator=operator, remark="团长签收"
+            )
+        except StateTransitionError as e:
+            raise OrderStateError(str(e))
 
         self.db.flush()
         return order
@@ -380,12 +335,13 @@ class OrderService:
         if not self._validate_transition(order.status, OrderStatus.PICKED_UP):
             raise OrderStateError(f"订单状态 {order.status.value} 不允许提货")
 
-        old_status = order.status.value
-        order.status = OrderStatus.PICKED_UP
-        order.picked_up_at = datetime.utcnow()
-
-        self._log_status_change(order, old_status, OrderStatus.PICKED_UP.value,
-                                operator=operator, remark="用户提货")
+        try:
+            self.state_machine.transition(
+                order, OrderStatus.PICKED_UP,
+                operator=operator, remark="用户提货"
+            )
+        except StateTransitionError as e:
+            raise OrderStateError(str(e))
 
         self.db.flush()
         return order
@@ -397,12 +353,13 @@ class OrderService:
         if not self._validate_transition(order.status, OrderStatus.COMPLETED):
             raise OrderStateError(f"订单状态 {order.status.value} 不允许完成")
 
-        old_status = order.status.value
-        order.status = OrderStatus.COMPLETED
-        order.completed_at = datetime.utcnow()
-
-        self._log_status_change(order, old_status, OrderStatus.COMPLETED.value,
-                                operator=operator, remark="订单完成")
+        try:
+            self.state_machine.transition(
+                order, OrderStatus.COMPLETED,
+                operator=operator, remark="订单完成"
+            )
+        except StateTransitionError as e:
+            raise OrderStateError(str(e))
 
         self.db.flush()
         return order
@@ -467,14 +424,15 @@ class OrderService:
 
         after_sale.refund_amount = round(min(total_refund, order.paid_amount), 2)
 
-        if not self._validate_transition(order.status, OrderStatus.REFUNDING):
-            pass
-        else:
-            old_status = order.status.value
-            order.status = OrderStatus.REFUNDING
-            order.payment_status = PaymentStatus.REFUNDING
-            self._log_status_change(order, old_status, OrderStatus.REFUNDING.value,
-                                    remark=f"售后申请: {after_sale_no}")
+        if self._validate_transition(order.status, OrderStatus.REFUNDING):
+            try:
+                self.state_machine.transition(
+                    order, OrderStatus.REFUNDING,
+                    operator="system",
+                    remark=f"售后申请: {after_sale_no}"
+                )
+            except StateTransitionError:
+                pass
 
         self.db.flush()
         return after_sale
@@ -492,12 +450,15 @@ class OrderService:
 
         order = self.db.query(Order).filter(Order.id == after_sale.order_id).first()
         if order.status != OrderStatus.REFUNDING:
-            old_status = order.status.value
-            order.status = OrderStatus.REFUNDING
-            order.payment_status = PaymentStatus.REFUNDING
-            self._log_status_change(order, old_status, OrderStatus.REFUNDING.value,
-                                    operator=operator,
-                                    remark=f"售后审批通过: {after_sale.after_sale_no}")
+            if self._validate_transition(order.status, OrderStatus.REFUNDING):
+                try:
+                    self.state_machine.transition(
+                        order, OrderStatus.REFUNDING,
+                        operator=operator,
+                        remark=f"售后审批通过: {after_sale.after_sale_no}"
+                    )
+                except StateTransitionError:
+                    pass
 
         self.db.flush()
         return after_sale
@@ -517,7 +478,11 @@ class OrderService:
 
         order = self.db.query(Order).filter(Order.id == after_sale.order_id).first()
         if order.status == OrderStatus.REFUNDING:
-            order.status = OrderStatus.COMPLETED if order.picked_up_at else OrderStatus.DELIVERED
+            if order.picked_up_at:
+                target = OrderStatus.COMPLETED
+            else:
+                target = OrderStatus.DELIVERED
+            order.status = target
             order.payment_status = PaymentStatus.PAID
 
         self.db.flush()
@@ -534,12 +499,14 @@ class OrderService:
         after_sale.refunded_at = datetime.utcnow()
 
         order = self.db.query(Order).filter(Order.id == after_sale.order_id).first()
-        old_status = order.status.value
-        order.status = OrderStatus.REFUNDED
-        order.payment_status = PaymentStatus.REFUNDED
-        self._log_status_change(order, old_status, OrderStatus.REFUNDED.value,
-                                operator=operator,
-                                remark=f"售后退款完成: {after_sale.after_sale_no}, 金额¥{after_sale.refund_amount}")
+        try:
+            self.state_machine.transition(
+                order, OrderStatus.REFUNDED,
+                operator=operator,
+                remark=f"售后退款完成: {after_sale.after_sale_no}, 金额¥{after_sale.refund_amount}"
+            )
+        except StateTransitionError:
+            pass
 
         after_sale.status = AfterSaleStatus.CLOSED
         after_sale.closed_at = datetime.utcnow()

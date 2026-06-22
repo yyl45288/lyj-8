@@ -4,6 +4,8 @@ from app.models import (
     DeliveryRoute, DeliveryStop, Vehicle, VehicleStatus,
     DeliveryStatus, Order, OrderStatus, Leader, SortingTask, SortingStatus
 )
+from app.modules.side_effect_registry import SideEffectRegistry
+from app.modules.order_state_machine import StateTransitionError
 from typing import List, Dict, Optional, Tuple
 from collections import defaultdict
 import math
@@ -44,6 +46,8 @@ class DispatchService:
         self.geo = GeoCalculator()
         self.WAREHOUSE_LAT = 31.2304
         self.WAREHOUSE_LON = 121.4737
+        self.registry = SideEffectRegistry(db)
+        self.state_machine = self.registry.state_machine
 
     def get_available_vehicles(self, district: str = None) -> List[Vehicle]:
         query = self.db.query(Vehicle).filter(
@@ -270,7 +274,13 @@ class DispatchService:
                 )
                 self.db.add(stop)
 
-                order.status = OrderStatus.DELIVERING
+                try:
+                    self.state_machine.transition(
+                        order, OrderStatus.DELIVERING,
+                        operator=operator, remark="开始配送"
+                    )
+                except StateTransitionError:
+                    pass
 
         vehicle.status = VehicleStatus.LOADING
         vehicle.current_load = total_volume
@@ -330,8 +340,13 @@ class DispatchService:
 
         order = self.db.query(Order).filter(Order.id == stop.order_id).first()
         if order and order.status == OrderStatus.DELIVERING:
-            order.status = OrderStatus.DELIVERED
-            order.delivered_at = datetime.utcnow()
+            try:
+                self.state_machine.transition(
+                    order, OrderStatus.DELIVERED,
+                    operator=operator, remark="团长签收"
+                )
+            except StateTransitionError:
+                pass
 
         same_seq_stops = self.db.query(DeliveryStop).filter(
             DeliveryStop.route_id == stop.route_id,
@@ -342,8 +357,13 @@ class DispatchService:
                 s.arrived_at = stop.arrived_at
                 o = self.db.query(Order).filter(Order.id == s.order_id).first()
                 if o and o.status == OrderStatus.DELIVERING:
-                    o.status = OrderStatus.DELIVERED
-                    o.delivered_at = datetime.utcnow()
+                    try:
+                        self.state_machine.transition(
+                            o, OrderStatus.DELIVERED,
+                            operator=operator, remark="团长签收"
+                        )
+                    except StateTransitionError:
+                        pass
 
         self.db.flush()
         return stop

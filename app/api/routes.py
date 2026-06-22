@@ -10,6 +10,7 @@ from app.modules.inventory import InventoryService, InventoryInsufficientError, 
 from app.modules.pricing import PricingService, CouponEngine
 from app.modules.order_service import OrderService, OrderStateError
 from app.modules.dispatch import DispatchService, DispatchError
+from app.modules.route_transaction_helper import TransactionalRouteHelper
 
 router = APIRouter(prefix="/api", tags=["API"])
 
@@ -150,7 +151,7 @@ def create_order(req: CreateOrderRequest, db: Session = Depends(get_db)):
     warehouse_date = req.warehouse_date or get_today_warehouse_date()
     items = [{"product_id": it.product_id, "qty": it.qty} for it in req.items]
 
-    try:
+    def _op(db):
         service = OrderService(db)
         order, price_result = service.create_order(
             user_id=req.user_id,
@@ -160,44 +161,43 @@ def create_order(req: CreateOrderRequest, db: Session = Depends(get_db)):
             user_coupon_id=req.user_coupon_id,
             remark=req.remark
         )
-        db.commit()
-
         details = service.get_order_details(order.id)
         return {"data": details, "message": "订单创建成功"}
-    except (InventoryInsufficientError, OrderStateError, InventoryError) as e:
-        db.rollback()
-        raise HTTPException(400, str(e))
-    except Exception as e:
-        db.rollback()
-        raise HTTPException(500, f"创建订单失败: {str(e)}")
+
+    return TransactionalRouteHelper.handle(
+        _op, db,
+        bad_request_errors=(InventoryInsufficientError, OrderStateError, InventoryError),
+        error_500_msg="创建订单失败"
+    )
 
 
 @router.post("/orders/{order_id}/pay")
 def pay_order(order_id: int, db: Session = Depends(get_db)):
-    try:
+    def _op(db):
         service = OrderService(db)
         order = service.pay_order(order_id)
-        db.commit()
         return {"data": service.get_order_details(order_id), "message": "支付成功"}
-    except OrderStateError as e:
-        db.rollback()
-        raise HTTPException(400, str(e))
-    except Exception as e:
-        db.rollback()
-        raise HTTPException(500, f"支付失败: {str(e)}")
+
+    return TransactionalRouteHelper.handle(
+        _op, db,
+        bad_request_errors=(OrderStateError,),
+        error_500_msg="支付失败"
+    )
 
 
 @router.post("/orders/{order_id}/cancel")
 def cancel_order(order_id: int, reason: Optional[str] = None,
                  operator: str = "user", db: Session = Depends(get_db)):
-    try:
+    def _op(db):
         service = OrderService(db)
         order = service.cancel_order(order_id, operator=operator, reason=reason)
-        db.commit()
         return {"data": service.get_order_details(order_id), "message": "订单已取消"}
-    except OrderStateError as e:
-        db.rollback()
-        raise HTTPException(400, str(e))
+
+    return TransactionalRouteHelper.handle(
+        _op, db,
+        bad_request_errors=(OrderStateError,),
+        error_500_msg="取消订单失败"
+    )
 
 
 @router.get("/orders")
@@ -239,17 +239,20 @@ def get_order(order_id: int, db: Session = Depends(get_db)):
 def cutoff_orders(warehouse_date: Optional[str] = None,
                   db: Session = Depends(get_db)):
     warehouse_date = warehouse_date or get_today_warehouse_date()
-    try:
+
+    def _op(db):
         service = OrderService(db)
         orders = service.cutoff_orders(warehouse_date)
-        db.commit()
         return {
             "data": {"warehouse_date": warehouse_date, "processed_count": len(orders)},
             "message": f"截单完成，处理订单 {len(orders)} 个"
         }
-    except OrderStateError as e:
-        db.rollback()
-        raise HTTPException(400, str(e))
+
+    return TransactionalRouteHelper.handle(
+        _op, db,
+        bad_request_errors=(OrderStateError,),
+        error_500_msg="截单失败"
+    )
 
 
 @router.get("/sorting/tasks")
@@ -310,40 +313,46 @@ def list_sorting_tasks(warehouse_date: Optional[str] = None,
 @router.post("/sorting/tasks/{task_id}/start")
 def start_sorting(task_id: int, operator: str = "sorter",
                   db: Session = Depends(get_db)):
-    try:
+    def _op(db):
         service = OrderService(db)
-        task = service.start_sorting(task_id, operator=operator)
-        db.commit()
+        service.start_sorting(task_id, operator=operator)
         return {"message": "分拣已开始"}
-    except OrderStateError as e:
-        db.rollback()
-        raise HTTPException(400, str(e))
+
+    return TransactionalRouteHelper.handle(
+        _op, db,
+        bad_request_errors=(OrderStateError,),
+        error_500_msg="开始分拣失败"
+    )
 
 
 @router.post("/sorting/tasks/{task_id}/items/{item_id}/sort")
 def sort_item(task_id: int, item_id: int, qty: int = 1,
               operator: str = "sorter", db: Session = Depends(get_db)):
-    try:
+    def _op(db):
         service = OrderService(db)
         service.sort_item(task_id, item_id, qty, operator=operator)
-        db.commit()
         return {"message": "分拣更新成功"}
-    except OrderStateError as e:
-        db.rollback()
-        raise HTTPException(400, str(e))
+
+    return TransactionalRouteHelper.handle(
+        _op, db,
+        bad_request_errors=(OrderStateError,),
+        error_500_msg="分拣更新失败"
+    )
 
 
 @router.post("/sorting/tasks/{task_id}/complete")
 def complete_sorting(task_id: int, operator: str = "sorter",
                      db: Session = Depends(get_db)):
-    try:
+    def _op(db):
         service = OrderService(db)
         service.complete_sorting(task_id, operator=operator)
-        db.commit()
         return {"message": "分拣完成"}
-    except OrderStateError as e:
-        db.rollback()
-        raise HTTPException(400, str(e))
+
+    return TransactionalRouteHelper.handle(
+        _op, db,
+        bad_request_errors=(OrderStateError,),
+        error_500_msg="完成分拣失败"
+    )
 
 
 @router.post("/dispatch/routes")
@@ -351,53 +360,62 @@ def create_routes(warehouse_date: Optional[str] = None,
                   strategy: str = "district",
                   db: Session = Depends(get_db)):
     warehouse_date = warehouse_date or get_today_warehouse_date()
-    try:
+
+    def _op(db):
         service = DispatchService(db)
         routes = service.create_delivery_routes(warehouse_date, strategy=strategy)
-        db.commit()
         return {
             "data": {"count": len(routes), "warehouse_date": warehouse_date},
             "message": f"生成 {len(routes)} 条配送路线"
         }
-    except DispatchError as e:
-        db.rollback()
-        raise HTTPException(400, str(e))
+
+    return TransactionalRouteHelper.handle(
+        _op, db,
+        bad_request_errors=(DispatchError,),
+        error_500_msg="生成配送路线失败"
+    )
 
 
 @router.post("/dispatch/routes/{route_id}/dispatch")
 def dispatch_route(route_id: int, db: Session = Depends(get_db)):
-    try:
+    def _op(db):
         service = DispatchService(db)
         service.dispatch_route(route_id)
-        db.commit()
         return {"message": "发车成功"}
-    except DispatchError as e:
-        db.rollback()
-        raise HTTPException(400, str(e))
+
+    return TransactionalRouteHelper.handle(
+        _op, db,
+        bad_request_errors=(DispatchError,),
+        error_500_msg="发车失败"
+    )
 
 
 @router.post("/dispatch/stops/{stop_id}/arrive")
 def stop_arrive(stop_id: int, db: Session = Depends(get_db)):
-    try:
+    def _op(db):
         service = DispatchService(db)
         service.stop_arrived(stop_id)
-        db.commit()
         return {"message": "站点已到达"}
-    except DispatchError as e:
-        db.rollback()
-        raise HTTPException(400, str(e))
+
+    return TransactionalRouteHelper.handle(
+        _op, db,
+        bad_request_errors=(DispatchError,),
+        error_500_msg="站点到达确认失败"
+    )
 
 
 @router.post("/dispatch/stops/{stop_id}/depart")
 def stop_depart(stop_id: int, db: Session = Depends(get_db)):
-    try:
+    def _op(db):
         service = DispatchService(db)
         service.stop_departed(stop_id)
-        db.commit()
         return {"message": "站点已离开"}
-    except DispatchError as e:
-        db.rollback()
-        raise HTTPException(400, str(e))
+
+    return TransactionalRouteHelper.handle(
+        _op, db,
+        bad_request_errors=(DispatchError,),
+        error_500_msg="站点离开确认失败"
+    )
 
 
 @router.get("/dispatch/summary")
@@ -427,78 +445,90 @@ def get_route(route_id: int, db: Session = Depends(get_db)):
 
 @router.post("/orders/{order_id}/pickup")
 def pickup_order(order_id: int, db: Session = Depends(get_db)):
-    try:
+    def _op(db):
         service = OrderService(db)
         order = service.mark_picked_up(order_id)
-        db.commit()
         return {"data": service.get_order_details(order_id), "message": "用户已提货"}
-    except OrderStateError as e:
-        db.rollback()
-        raise HTTPException(400, str(e))
+
+    return TransactionalRouteHelper.handle(
+        _op, db,
+        bad_request_errors=(OrderStateError,),
+        error_500_msg="提货确认失败"
+    )
 
 
 @router.post("/orders/{order_id}/complete")
 def complete_order(order_id: int, db: Session = Depends(get_db)):
-    try:
+    def _op(db):
         service = OrderService(db)
         order = service.complete_order(order_id)
-        db.commit()
         return {"data": service.get_order_details(order_id), "message": "订单完成"}
-    except OrderStateError as e:
-        db.rollback()
-        raise HTTPException(400, str(e))
+
+    return TransactionalRouteHelper.handle(
+        _op, db,
+        bad_request_errors=(OrderStateError,),
+        error_500_msg="订单完成失败"
+    )
 
 
 @router.post("/aftersale")
 def create_aftersale(req: AfterSaleRequest, db: Session = Depends(get_db)):
-    try:
+    def _op(db):
         service = OrderService(db)
         items = [{"order_item_id": it.order_item_id, "qty": it.qty} for it in req.items]
         after_sale = service.apply_after_sale(
             req.order_id, req.user_id, req.reason, items, req.description
         )
-        db.commit()
         return {"data": {"id": after_sale.id, "after_sale_no": after_sale.after_sale_no},
                 "message": "售后申请已提交"}
-    except OrderStateError as e:
-        db.rollback()
-        raise HTTPException(400, str(e))
+
+    return TransactionalRouteHelper.handle(
+        _op, db,
+        bad_request_errors=(OrderStateError,),
+        error_500_msg="提交售后申请失败"
+    )
 
 
 @router.post("/aftersale/{id}/approve")
 def approve_aftersale(id: int, db: Session = Depends(get_db)):
-    try:
+    def _op(db):
         service = OrderService(db)
         service.approve_after_sale(id)
-        db.commit()
         return {"message": "售后已通过"}
-    except OrderStateError as e:
-        db.rollback()
-        raise HTTPException(400, str(e))
+
+    return TransactionalRouteHelper.handle(
+        _op, db,
+        bad_request_errors=(OrderStateError,),
+        error_500_msg="售后审批失败"
+    )
 
 
 @router.post("/aftersale/{id}/reject")
 def reject_aftersale(id: int, reason: str, db: Session = Depends(get_db)):
-    try:
+    def _op(db):
         service = OrderService(db)
         service.reject_after_sale(id, reason)
-        db.commit()
         return {"message": "售后已拒绝"}
-    except OrderStateError as e:
-        db.rollback()
-        raise HTTPException(400, str(e))
+
+    return TransactionalRouteHelper.handle(
+        _op, db,
+        bad_request_errors=(OrderStateError,),
+        error_500_msg="售后拒绝失败"
+    )
 
 
 @router.post("/aftersale/{id}/refund")
 def execute_refund(id: int, db: Session = Depends(get_db)):
-    try:
+    def _op(db):
         service = OrderService(db)
         service.execute_refund(id)
-        db.commit()
         return {"message": "退款完成"}
-    except OrderStateError as e:
-        db.rollback()
-        raise HTTPException(400, str(e))
+
+    return TransactionalRouteHelper.handle(
+        _op, db,
+        bad_request_errors=(OrderStateError,),
+        error_500_msg="退款失败"
+    )
 
 
 @router.get("/inventory/summary")
@@ -512,17 +542,18 @@ def inventory_summary(warehouse_date: Optional[str] = None,
 
 @router.post("/inventory/clean-expired")
 def clean_expired_reservations(db: Session = Depends(get_db)):
-    try:
+    def _op(db):
         service = InventoryService(db)
         result = service.clean_all_expired_reservations()
-        db.commit()
         return {
             "data": result,
             "message": f"清理完成：取消订单 {result['cancelled_orders']} 个，释放锁定 {result['cleaned_reservations']} 条"
         }
-    except Exception as e:
-        db.rollback()
-        raise HTTPException(500, f"清理失败: {str(e)}")
+
+    return TransactionalRouteHelper.handle(
+        _op, db,
+        error_500_msg="清理失败"
+    )
 
 
 @router.get("/dashboard/stats")
