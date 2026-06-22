@@ -1,0 +1,159 @@
+{% extends "base.html" %}
+{% block content %}
+<div class="page-header">
+    <h2>总览仪表盘</h2>
+    <p>实时监控社区团购全链路履约状态</p>
+</div>
+
+<div hx-get="/api/dashboard/stats" hx-trigger="load, every 10s" hx-swap="innerHTML">
+    <div class="stats-grid" style="margin-bottom:24px">
+        <div class="stat-card blue">
+            <div class="stat-label">今日总订单</div>
+            <div class="stat-value">加载中...</div>
+        </div>
+        <div class="stat-card green">
+            <div class="stat-label">今日成交额</div>
+            <div class="stat-value">¥0</div>
+        </div>
+        <div class="stat-card orange">
+            <div class="stat-label">在售商品数</div>
+            <div class="stat-value">0</div>
+        </div>
+        <div class="stat-card red">
+            <div class="stat-label">低库存商品</div>
+            <div class="stat-value">0</div>
+        </div>
+    </div>
+
+    <div class="grid-2" style="margin-bottom:24px">
+        <div class="card">
+            <div class="card-header"><h3>📋 订单状态分布</h3></div>
+            <div class="card-body">
+                <div id="order-status-chart">加载中...</div>
+            </div>
+        </div>
+        <div class="card">
+            <div class="card-header"><h3>📦 分拣进度</h3></div>
+            <div class="card-body">
+                <div id="sorting-stats">加载中...</div>
+            </div>
+        </div>
+    </div>
+
+    <div class="card">
+        <div class="card-header"><h3>🚚 配送调度概览</h3></div>
+        <div class="card-body">
+            <div id="dispatch-overview">加载中...</div>
+        </div>
+    </div>
+</div>
+
+<script>
+document.body.addEventListener('htmx:afterOnLoad', function(evt) {
+    if (evt.detail.pathInfo.requestPath === '/api/dashboard/stats') {
+        try {
+            const response = JSON.parse(evt.detail.xhr.responseText);
+            if (response && response.data) {
+                renderDashboard(response.data);
+            }
+        } catch(e) {}
+    }
+});
+
+function renderDashboard(data) {
+    const statusLabels = {
+        created: '待支付', paid: '已支付', cutoff: '已截单',
+        sorting: '分拣中', sorted: '分拣完成', delivering: '配送中',
+        delivered: '团长签收', picked_up: '已提货', completed: '已完成',
+        cancelled: '已取消', refunding: '退款中', refunded: '已退款'
+    };
+    const statusColors = {
+        created: 'badge-gray', paid: 'badge-blue', cutoff: 'badge-purple',
+        sorting: 'badge-orange', sorted: 'badge-yellow', delivering: 'badge-blue',
+        delivered: 'badge-green', picked_up: 'badge-green', completed: 'badge-green',
+        cancelled: 'badge-red', refunding: 'badge-orange', refunded: 'badge-red'
+    };
+    const os = data.orders_by_status || {};
+    const total = Object.values(os).reduce((a,b)=>a+b,0);
+    let orderHtml = '<div class="stats-grid" style="grid-template-columns: repeat(3,1fr);gap:10px;margin-bottom:16px">';
+    for (const [k, v] of Object.entries(os)) {
+        const pct = total > 0 ? Math.round(v/total*100) : 0;
+        orderHtml += `<div><div style="display:flex;justify-content:space-between;margin-bottom:4px"><span style="font-size:12px;color:#718096">${statusLabels[k]||k}</span><span class="badge ${statusColors[k]||'badge-gray'}">${v}</span></div><div class="progress-bar"><div class="progress-fill" style="width:${pct}%;background:#4a5568"></div></div></div>`;
+    }
+    orderHtml += '</div>';
+    orderHtml += `<div style="font-size:13px;color:#718096">今日仓库日期: <strong>${data.warehouse_date}</strong></div>`;
+    const osChart = document.getElementById('order-status-chart');
+    if (osChart) osChart.innerHTML = orderHtml;
+
+    const s = data.sorting || {};
+    const sortTotal = (s.pending||0) + (s.in_progress||0) + (s.completed||0);
+    const sortPct = sortTotal>0 ? Math.round((s.completed||0)/sortTotal*100) : 0;
+    let sortHtml = `
+        <div class="stats-grid" style="grid-template-columns:repeat(3,1fr);gap:12px;margin-bottom:16px">
+            <div><div style="font-size:12px;color:#718096">待分拣</div><div style="font-size:22px;font-weight:700;color:#e53e3e">${s.pending||0}</div></div>
+            <div><div style="font-size:12px;color:#718096">分拣中</div><div style="font-size:22px;font-weight:700;color:#ed8936">${s.in_progress||0}</div></div>
+            <div><div style="font-size:12px;color:#718096">已完成</div><div style="font-size:22px;font-weight:700;color:#38a169">${s.completed||0}</div></div>
+        </div>
+        <div style="margin-bottom:6px;display:flex;justify-content:space-between;font-size:12px;color:#718096">
+            <span>总体进度</span><span>${sortPct}% (${s.completed||0}/${sortTotal})</span>
+        </div>
+        <div class="progress-bar" style="height:10px"><div class="progress-fill" style="width:${sortPct}%"></div></div>
+    `;
+    const sortEl = document.getElementById('sorting-stats');
+    if (sortEl) sortEl.innerHTML = sortHtml;
+
+    const d = data.dispatch || {};
+    const v = d.vehicles || {};
+    const vs = v.by_status || {};
+    const rbs = d.routes_by_status || {};
+    const routeLabels = {pending:'待发车',dispatched:'已发车',in_transit:'配送中',arrived:'已完成'};
+    const routeColors = {pending:'badge-yellow',dispatched:'badge-blue',in_transit:'badge-blue',arrived:'badge-green'};
+    let dispHtml = `
+        <div class="stats-grid" style="grid-template-columns:repeat(4,1fr);gap:12px;margin-bottom:20px">
+            <div class="stat-card" style="box-shadow:none;padding:0;background:#f7fafc">
+                <div class="stat-label">待配送订单</div>
+                <div class="stat-value">${d.ready_orders||0}</div>
+            </div>
+            <div class="stat-card" style="box-shadow:none;padding:0;background:#f7fafc">
+                <div class="stat-label">配送路线</div>
+                <div class="stat-value">${d.total_routes||0}</div>
+            </div>
+            <div class="stat-card" style="box-shadow:none;padding:0;background:#f7fafc">
+                <div class="stat-label">总站点数</div>
+                <div class="stat-value">${d.total_stops||0}</div>
+            </div>
+            <div class="stat-card" style="box-shadow:none;padding:0;background:#f7fafc">
+                <div class="stat-label">总货量</div>
+                <div class="stat-value" style="font-size:20px">${d.total_volume||0}<span style="font-size:14px;color:#718096"> m³</span></div>
+            </div>
+        </div>
+        <div style="display:grid;grid-template-columns:1fr 1fr;gap:24px">
+            <div>
+                <h4 style="font-size:13px;color:#4a5568;margin-bottom:10px">路线状态</h4>
+                <div style="display:flex;flex-wrap:wrap;gap:8px">`;
+    for (const [k,v] of Object.entries(rbs)) {
+        dispHtml += `<span class="badge ${routeColors[k]||'badge-gray'}">${routeLabels[k]||k}: ${v}</span>`;
+    }
+    dispHtml += `</div></div>
+            <div>
+                <h4 style="font-size:13px;color:#4a5568;margin-bottom:10px">车辆状态 (共${v.total||0}辆)</h4>
+                <div style="display:flex;flex-wrap:wrap;gap:8px">`;
+    const vLabels = {idle:'空闲',loading:'装车中',delivering:'配送中',maintenance:'维护'};
+    const vColors = {idle:'badge-green',loading:'badge-yellow',delivering:'badge-blue',maintenance:'badge-red'};
+    for (const [k,v] of Object.entries(vs)) {
+        dispHtml += `<span class="badge ${vColors[k]||'badge-gray'}">${vLabels[k]||k}: ${v}</span>`;
+    }
+    dispHtml += `</div></div></div>`;
+    const dispEl = document.getElementById('dispatch-overview');
+    if (dispEl) dispEl.innerHTML = dispHtml;
+
+    const cards = document.querySelectorAll('.stat-card');
+    if (cards.length >= 4 && data) {
+        cards[0].querySelector('.stat-value').textContent = data.total_orders || 0;
+        cards[1].querySelector('.stat-value').textContent = '¥' + (data.total_gmv || 0).toFixed(2);
+        cards[2].querySelector('.stat-value').textContent = data.total_products_in_stock || 0;
+        cards[3].querySelector('.stat-value').textContent = data.low_stock_count || 0;
+    }
+}
+</script>
+{% endblock %}

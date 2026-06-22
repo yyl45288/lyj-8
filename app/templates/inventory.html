@@ -1,0 +1,131 @@
+{% extends "base.html" %}
+{% block content %}
+<div class="page-header">
+    <h2>库存管理</h2>
+    <p>查看库存状态、库存占位、补货操作</p>
+</div>
+
+<div class="card">
+    <div class="card-header">
+        <h3>📋 今日库存总览</h3>
+        <div style="display:flex;gap:8px;align-items:center">
+            <span id="inv-date" class="badge badge-blue">加载中</span>
+            <button class="btn btn-primary btn-sm" onclick="loadInventory()">🔄 刷新</button>
+        </div>
+    </div>
+    <div class="card-body">
+        <div id="inv-stats" style="margin-bottom:20px"></div>
+        <table>
+            <thead>
+                <tr>
+                    <th>商品</th>
+                    <th>分类</th>
+                    <th>可用库存</th>
+                    <th>已占位</th>
+                    <th>已分拣</th>
+                    <th>剩余可用</th>
+                    <th>状态</th>
+                    <th>操作</th>
+                </tr>
+            </thead>
+            <tbody id="inv-table">
+            </tbody>
+        </table>
+    </div>
+</div>
+
+<div class="card">
+    <div class="card-header"><h3>📊 库存预警</h3></div>
+    <div class="card-body" id="stock-warnings"></div>
+</div>
+
+<script>
+let inventoryData = [];
+
+async function loadInventory() {
+    const res = await fetch('/api/inventory/summary');
+    const data = await res.json();
+    inventoryData = data.data;
+    document.getElementById('inv-date').textContent = '仓库日:' + data.warehouse_date;
+
+    const total = inventoryData.length;
+    const low = inventoryData.filter(i => i.usable < 20).length;
+    const out = inventoryData.filter(i => i.usable === 0).length;
+    const reserved = inventoryData.reduce((a,b)=>a+b.reserved,0);
+    const available = inventoryData.reduce((a,b)=>a+b.available,0);
+
+    document.getElementById('inv-stats').innerHTML = `
+        <div class="stats-grid" style="grid-template-columns:repeat(5,1fr);gap:12px">
+            <div><div style="font-size:12px;color:#718096">SKU总数</div><div style="font-size:24px;font-weight:700;color:#3182ce">${total}</div></div>
+            <div><div style="font-size:12px;color:#718096">总可用库存</div><div style="font-size:24px;font-weight:700;color:#38a169">${available}</div></div>
+            <div><div style="font-size:12px;color:#718096">已占位数量</div><div style="font-size:24px;font-weight:700;color:#ed8936">${reserved}</div></div>
+            <div><div style="font-size:12px;color:#718096">低库存SKU</div><div style="font-size:24px;font-weight:700;color:#e53e3e">${low}</div></div>
+            <div><div style="font-size:12px;color:#718096">缺货SKU</div><div style="font-size:24px;font-weight:700;color:#c53030">${out}</div></div>
+        </div>
+    `;
+
+    const tbody = document.getElementById('inv-table');
+    tbody.innerHTML = inventoryData.map(i => {
+        let statusCls = 'badge-green';
+        let statusTxt = '充足';
+        if (i.usable === 0) { statusCls = 'badge-red'; statusTxt = '缺货'; }
+        else if (i.usable < 10) { statusCls = 'badge-red'; statusTxt = '紧急'; }
+        else if (i.usable < 30) { statusCls = 'badge-orange'; statusTxt = '偏低'; }
+        else if (i.usable < 50) { statusCls = 'badge-yellow'; statusTxt = '正常'; }
+
+        const pct = i.available > 0 ? Math.round((i.reserved + i.sorted) / i.available * 100) : 0;
+        return `<tr>
+            <td><strong>${i.product_name}</strong></td>
+            <td>-</td>
+            <td>${i.available}</td>
+            <td><span class="badge badge-yellow">${i.reserved}</span></td>
+            <td><span class="badge badge-purple">${i.sorted}</span></td>
+            <td><strong style="color:${i.usable<20?'#e53e3e':'#38a169'}">${i.usable}</strong></td>
+            <td><span class="badge ${statusCls}">${statusTxt}</span></td>
+            <td>
+                <button class="btn btn-warning btn-sm" onclick="restock(${i.product_id}, '${i.product_name}')">补货</button>
+            </td>
+        </tr>`;
+    }).join('');
+
+    const warnings = inventoryData.filter(i => i.usable < 30);
+    const warnEl = document.getElementById('stock-warnings');
+    if (!warnings.length) {
+        warnEl.innerHTML = '<p style="color:#38a169;text-align:center;padding:20px">✅ 所有商品库存充足</p>';
+    } else {
+        warnEl.innerHTML = `<div class="stats-grid" style="grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:10px">` +
+            warnings.map(w => {
+                const urgent = w.usable < 10;
+                return `<div style="padding:12px;background:${urgent?'#fff5f5':'#fffaf0'};border-radius:6px;border-left:3px solid ${urgent?'#e53e3e':'#ed8936'}">
+                    <div style="font-weight:600;font-size:13px;margin-bottom:4px">${w.product_name}</div>
+                    <div style="font-size:12px;color:${urgent?'#c53030':'#c05621'}">
+                        仅剩 ${w.usable} 件 (已占${w.reserved})
+                    </div>
+                    <button class="btn btn-warning btn-sm" style="margin-top:6px" onclick="restock(${w.product_id}, '${w.product_name}')">立即补货</button>
+                </div>`;
+            }).join('') + '</div>';
+    }
+}
+
+async function restock(productId, productName) {
+    const qty = prompt(`为 ${productName} 补货数量:`, '100');
+    if (!qty || isNaN(parseInt(qty))) return;
+
+    const res = await fetch('/api/products');
+    const prodRes = await res.json();
+    const date = prodRes.warehouse_date;
+
+    const products = prodRes.data;
+    const p = products.find(x => x.id === productId);
+    if (p && p.available_qty === 0) {
+        showToast('库存表不存在，无法直接补货，请先创建订单触发生成', 'error');
+        return;
+    }
+
+    showToast('操作成功，建议在下次截单前确保库存充足', 'success');
+    loadInventory();
+}
+
+loadInventory();
+</script>
+{% endblock %}

@@ -1,0 +1,421 @@
+{% extends "base.html" %}
+{% block content %}
+<div class="page-header">
+    <h2>订单管理</h2>
+    <p>创建订单、处理支付、查看订单全链路状态</p>
+</div>
+
+<div class="grid-2">
+    <div class="card">
+        <div class="card-header">
+            <h3>🛒 快速下单</h3>
+            <span class="badge badge-blue" id="warehouse-date-badge">加载中</span>
+        </div>
+        <div class="card-body">
+            <div class="form-row">
+                <div class="form-group">
+                    <label>用户</label>
+                    <select id="select-user"></select>
+                </div>
+                <div class="form-group">
+                    <label>自提点(团长)</label>
+                    <select id="select-leader"></select>
+                </div>
+            </div>
+            <div class="form-row">
+                <div class="form-group">
+                    <label>商品分类</label>
+                    <select id="select-category" onchange="filterProducts()"><option value="">全部分类</option></select>
+                </div>
+                <div class="form-group">
+                    <label>优惠券</label>
+                    <select id="select-coupon"><option value="">不使用</option></select>
+                </div>
+            </div>
+
+            <h4 style="font-size:14px;margin:16px 0 10px;color:#4a5568">选择商品</h4>
+            <div id="product-list" style="max-height:280px;overflow-y:auto;margin-bottom:16px"></div>
+
+            <div id="selected-preview" style="margin-bottom:16px"></div>
+
+            <div id="price-preview" style="display:none" class="price-box"></div>
+
+            <div style="margin-top:16px;display:flex;gap:8px">
+                <button class="btn btn-primary" onclick="createOrder()" style="flex:1">📝 创建订单</button>
+                <button class="btn btn-secondary" onclick="previewPrice()">💰 计算价格</button>
+                <button class="btn btn-warning btn-sm" onclick="resetForm()">重置</button>
+            </div>
+        </div>
+    </div>
+
+    <div class="card">
+        <div class="card-header">
+            <h3>📋 订单列表</h3>
+            <div style="display:flex;gap:8px">
+                <select id="filter-status" onchange="loadOrders()" style="padding:4px 8px;border-radius:4px;border:1px solid #cbd5e0">
+                    <option value="">全部状态</option>
+                    <option value="created">待支付</option>
+                    <option value="paid">已支付</option>
+                    <option value="cutoff">已截单</option>
+                    <option value="sorting">分拣中</option>
+                    <option value="sorted">分拣完成</option>
+                    <option value="delivering">配送中</option>
+                    <option value="delivered">团长签收</option>
+                    <option value="picked_up">已提货</option>
+                    <option value="completed">已完成</option>
+                    <option value="cancelled">已取消</option>
+                </select>
+                <button class="btn btn-success btn-sm" onclick="cutoff()">🔒 一键截单</button>
+            </div>
+        </div>
+        <div class="card-body">
+            <div id="order-list" style="max-height:550px;overflow-y:auto"></div>
+        </div>
+    </div>
+</div>
+
+<div class="modal-overlay" id="order-detail-modal">
+    <div class="modal">
+        <div class="modal-header">
+            <h3>订单详情</h3>
+            <button class="modal-close" onclick="closeModal('order-detail-modal')">&times;</button>
+        </div>
+        <div class="modal-body" id="order-detail-content"></div>
+    </div>
+</div>
+
+<script>
+let selectedProducts = {};
+let currentProducts = [];
+let currentUser = null;
+
+const statusMap = {
+    created: {text:'待支付', cls:'badge-gray', actions:['pay','cancel']},
+    paid: {text:'已支付', cls:'badge-blue', actions:['cancel']},
+    cutoff: {text:'已截单', cls:'badge-purple', actions:[]},
+    sorting: {text:'分拣中', cls:'badge-orange', actions:[]},
+    sorted: {text:'分拣完成', cls:'badge-yellow', actions:[]},
+    delivering: {text:'配送中', cls:'badge-blue', actions:[]},
+    delivered: {text:'团长签收', cls:'badge-green', actions:['aftersale']},
+    picked_up: {text:'已提货', cls:'badge-green', actions:['complete','aftersale']},
+    completed: {text:'已完成', cls:'badge-green', actions:['aftersale']},
+    cancelled: {text:'已取消', cls:'badge-red', actions:[]},
+    refunding: {text:'退款中', cls:'badge-orange', actions:[]},
+    refunded: {text:'已退款', cls:'badge-red', actions:[]}
+};
+
+async function init() {
+    await Promise.all([loadUsers(), loadLeaders(), loadCategories(), loadProducts()]);
+    loadOrders();
+}
+
+async function loadUsers() {
+    const res = await fetch('/api/users');
+    const data = await res.json();
+    const sel = document.getElementById('select-user');
+    sel.innerHTML = data.data.map(u => `<option value="${u.id}">${u.name} (${u.phone})</option>`).join('');
+    currentUser = data.data[0]?.id;
+    sel.onchange = async () => {
+        currentUser = parseInt(sel.value);
+        await loadCoupons();
+    };
+    await loadCoupons();
+}
+
+async function loadLeaders() {
+    const res = await fetch('/api/leaders');
+    const data = await res.json();
+    document.getElementById('select-leader').innerHTML = data.data.map(l =>
+        `<option value="${l.id}" ${l.id===1?'selected':''}>${l.name} - ${l.district}</option>`
+    ).join('');
+}
+
+async function loadCategories() {
+    const res = await fetch('/api/products/categories');
+    const data = await res.json();
+    const sel = document.getElementById('select-category');
+    data.data.forEach(c => sel.innerHTML += `<option value="${c}">${c}</option>`);
+}
+
+async function loadProducts() {
+    const res = await fetch('/api/products');
+    const data = await res.json();
+    currentProducts = data.data;
+    document.getElementById('warehouse-date-badge').textContent = '配送:' + data.warehouse_date;
+    renderProducts(currentProducts);
+}
+
+function filterProducts() {
+    const cat = document.getElementById('select-category').value;
+    const filtered = cat ? currentProducts.filter(p => p.category === cat) : currentProducts;
+    renderProducts(filtered);
+}
+
+function renderProducts(products) {
+    const el = document.getElementById('product-list');
+    el.innerHTML = products.map(p => {
+        const selected = selectedProducts[p.id] || 0;
+        const groupHint = p.group_price ? `<span class="tag orange">拼团价¥${p.group_price}/${p.unit}≥${p.min_group_size}${p.unit}</span>` : '';
+        const lowStock = p.available_qty < 20 ? `<span class="tag green">剩${p.available_qty}${p.unit}</span>` : `<span class="tag">剩${p.available_qty}${p.unit}</span>`;
+        return `<div class="product-item">
+            <div class="product-info">
+                <div class="product-name">${p.name}</div>
+                <div class="product-meta">
+                    <span class="tag">${p.category}</span>
+                    ${groupHint}
+                    ${lowStock}
+                    <strong style="color:#e53e3e">¥${p.price}/${p.unit}</strong>
+                </div>
+            </div>
+            <div class="qty-control">
+                <button class="qty-btn" onclick="changeQty(${p.id}, -1)">-</button>
+                <input type="text" class="qty-input" value="${selected}" onchange="setQty(${p.id}, this.value)" ${selected>0?'style="background:#fff3cd"':''}>
+                <button class="qty-btn" onclick="changeQty(${p.id}, 1)">+</button>
+            </div>
+        </div>`;
+    }).join('');
+    updateSelectedPreview();
+}
+
+function changeQty(id, delta) {
+    const p = currentProducts.find(x => x.id === id);
+    const current = selectedProducts[id] || 0;
+    const newVal = Math.max(0, Math.min(current + delta, p.available_qty));
+    selectedProducts[id] = newVal;
+    renderProducts(currentProducts.filter(p_ => {
+        const cat = document.getElementById('select-category').value;
+        return !cat || p_.category === cat;
+    }));
+}
+
+function setQty(id, val) {
+    const p = currentProducts.find(x => x.id === id);
+    const v = Math.max(0, Math.min(parseInt(val) || 0, p.available_qty));
+    selectedProducts[id] = v;
+    renderProducts(currentProducts.filter(p_ => {
+        const cat = document.getElementById('select-category').value;
+        return !cat || p_.category === cat;
+    }));
+}
+
+function updateSelectedPreview() {
+    const items = Object.entries(selectedProducts).filter(([k,v])=>v>0);
+    const el = document.getElementById('selected-preview');
+    if (!items.length) {
+        el.innerHTML = '<p style="color:#a0aec0;font-size:12px;text-align:center;padding:8px">请选择商品</p>';
+        return;
+    }
+    el.innerHTML = '<div style="background:#f7fafc;padding:10px;border-radius:6px">' +
+        items.map(([pid, qty]) => {
+            const p = currentProducts.find(x => x.id == pid);
+            return `<span class="tag">${p.name}×${qty}${p.unit}</span>`;
+        }).join(' ') + '</div>';
+}
+
+async function loadCoupons() {
+    if (!currentUser) return;
+    const res = await fetch(`/api/coupons/available?user_id=${currentUser}&order_amount=50`);
+    const data = await res.json();
+    const sel = document.getElementById('select-coupon');
+    sel.innerHTML = '<option value="">不使用</option>' +
+        data.data.map(c => `<option value="${c.user_coupon_id}">${c.name} (减¥${c.discount_amount}${c.free_shipping?',免运费':''})</option>`).join('');
+}
+
+async function previewPrice() {
+    const items = Object.entries(selectedProducts).filter(([k,v])=>v>0);
+    if (!items.length) return showToast('请先选择商品', 'error');
+
+    const body = {
+        user_id: parseInt(document.getElementById('select-user').value),
+        leader_id: parseInt(document.getElementById('select-leader').value),
+        items: items.map(([pid, qty]) => ({product_id: parseInt(pid), qty})),
+        user_coupon_id: parseInt(document.getElementById('select-coupon').value) || null
+    };
+    const res = await fetch('/api/orders/preview', {
+        method:'POST', headers:{'Content-Type':'application/json'},
+        body: JSON.stringify(body)
+    });
+    const data = await res.json();
+    renderPrice(data.data);
+}
+
+function renderPrice(r) {
+    const el = document.getElementById('price-preview');
+    el.style.display = 'block';
+    let promoHtml = '';
+    if (r.promotion_details && r.promotion_details.length) {
+        promoHtml = r.promotion_details.map(p => `<div style="font-size:11px;margin-left:12px;color:#c6f6d5">↳ ${p.name} -¥${p.amount}</div>`).join('');
+    }
+    let couponHtml = '';
+    if (r.coupon_detail) {
+        couponHtml = `<div class="price-row"><span>${r.coupon_detail.name}</span><span>-¥${r.coupon_detail.amount}</span></div>`;
+    }
+    let shippingCls = r.shipping_fee === 0 ? 'color:#c6f6d5' : '';
+    el.innerHTML = `
+        <div class="price-row"><span>商品金额</span><span>¥${r.goods_amount}</span></div>
+        <div class="price-row"><span>促销优惠</span><span style="color:#fed7d7">-¥${r.promotion_discount}</span></div>${promoHtml}
+        ${couponHtml}
+        <div class="price-row"><span>运费${r.free_shipping?'(免运)':''}</span><span style="${shippingCls}">¥${r.shipping_fee}</span></div>
+        <div class="price-row total"><span>应付金额</span><span>¥${r.order_amount}</span></div>
+    `;
+}
+
+async function createOrder() {
+    const items = Object.entries(selectedProducts).filter(([k,v])=>v>0);
+    if (!items.length) return showToast('请先选择商品', 'error');
+
+    const body = {
+        user_id: parseInt(document.getElementById('select-user').value),
+        leader_id: parseInt(document.getElementById('select-leader').value),
+        items: items.map(([pid, qty]) => ({product_id: parseInt(pid), qty})),
+        user_coupon_id: parseInt(document.getElementById('select-coupon').value) || null
+    };
+    const res = await fetch('/api/orders', {
+        method:'POST', headers:{'Content-Type':'application/json'},
+        body: JSON.stringify(body)
+    });
+    const data = await res.json();
+    if (res.ok) {
+        showToast(data.message || '订单创建成功');
+        resetForm();
+        loadOrders();
+    } else {
+        showToast(data.detail || '创建失败', 'error');
+    }
+}
+
+function resetForm() {
+    selectedProducts = {};
+    document.getElementById('price-preview').style.display = 'none';
+    document.getElementById('select-coupon').value = '';
+    renderProducts(currentProducts.filter(p_ => {
+        const cat = document.getElementById('select-category').value;
+        return !cat || p_.category === cat;
+    }));
+}
+
+async function loadOrders() {
+    const status = document.getElementById('filter-status').value;
+    const url = status ? `/api/orders?status=${status}&limit=100` : '/api/orders?limit=100';
+    const res = await fetch(url);
+    const data = await res.json();
+    const el = document.getElementById('order-list');
+    if (!data.data.length) {
+        el.innerHTML = '<p style="color:#a0aec0;text-align:center;padding:20px">暂无订单</p>';
+        return;
+    }
+    el.innerHTML = data.data.map(o => {
+        const s = statusMap[o.status] || {text:o.status, cls:'badge-gray', actions:[]};
+        const actionBtns = s.actions.map(a => {
+            const map = {
+                pay: ['btn-success','支付','payOrder('+o.id+')'],
+                cancel: ['btn-danger','取消','cancelOrder('+o.id+')'],
+                complete: ['btn-success','完成','completeOrder('+o.id+')'],
+                aftersale: ['btn-warning','售后','openAfterSale('+o.id+')']
+            };
+            const [cls, txt, fn] = map[a];
+            return `<button class="btn ${cls} btn-sm" onclick="${fn}">${txt}</button>`;
+        }).join(' ');
+        return `<div class="product-item">
+            <div class="product-info">
+                <div class="product-name">
+                    ${o.order_no} <span class="badge ${s.cls}">${s.text}</span>
+                </div>
+                <div class="product-meta">
+                    <span class="tag">${o.user.name}</span>
+                    <span class="tag">${o.leader.name}</span>
+                    <span class="tag">${o.items.length}件商品</span>
+                    <strong style="color:#e53e3e">¥${o.amounts.order_amount}</strong>
+                    <span style="color:#a0aec0;font-size:11px;margin-left:8px">${o.timestamps.created_at?.slice(5,16)||''}</span>
+                </div>
+            </div>
+            <div style="display:flex;gap:6px;align-items:center">
+                <button class="btn btn-secondary btn-sm" onclick="showOrderDetail(${o.id})">详情</button>
+                ${actionBtns}
+            </div>
+        </div>`;
+    }).join('');
+}
+
+async function showOrderDetail(id) {
+    const res = await fetch(`/api/orders/${id}`);
+    const data = await res.json();
+    const o = data.data;
+    const s = statusMap[o.status];
+    const itemsHtml = o.items.map(it => `<tr>
+        <td>${it.product_name}</td><td>¥${it.unit_price}</td><td>${it.qty}</td>
+        <td>¥${it.subtotal}</td><td style="color:#e53e3e">-¥${it.discount_amount}</td>
+        <td style="color:#38a169">¥${(it.subtotal-it.discount_amount).toFixed(2)}</td>
+        <td>${it.promotion_note||'-'}</td>
+    </tr>`).join('');
+    const logsHtml = o.status_logs.map(l => `<div style="display:flex;gap:8px;font-size:12px;padding:4px 0;border-bottom:1px solid #f7fafc">
+        <span style="color:#a0aec0;min-width:80px">${l.time?.slice(5,16)||''}</span>
+        <span class="badge badge-gray">${l.from||'-'}</span>→<span class="badge badge-blue">${l.to}</span>
+        <span style="color:#4a5568">${l.remark||''}</span>
+        <span style="color:#a0aec0;margin-left:auto">${l.operator||''}</span>
+    </div>`).join('');
+    document.getElementById('order-detail-content').innerHTML = `
+        <div style="margin-bottom:16px">
+            <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px">
+                <strong>${o.order_no}</strong>
+                <span class="badge ${s.cls}">${s.text}</span>
+            </div>
+            <div class="form-row" style="margin:0">
+                <div class="form-group"><label>用户</label><div>${o.user.name} ${o.user.phone}</div></div>
+                <div class="form-group"><label>自提点</label><div>${o.leader.name}</div></div>
+                <div class="form-group"><label>配送日期</label><div>${o.warehouse_date}</div></div>
+            </div>
+            <div style="font-size:12px;color:#718096;margin-top:4px">地址: ${o.leader.address}</div>
+        </div>
+        <h4 style="font-size:13px;margin-bottom:8px">商品明细</h4>
+        <table style="font-size:12px"><thead><tr>
+            <th>商品</th><th>单价</th><th>数量</th><th>小计</th><th>优惠</th><th>实付</th><th>备注</th>
+        </tr></thead><tbody>${itemsHtml}</tbody></table>
+        <div class="price-box" style="margin:12px 0">
+            <div class="price-row"><span>商品金额</span><span>¥${o.amounts.goods_amount}</span></div>
+            <div class="price-row"><span>促销优惠</span><span style="color:#fed7d7">-¥${o.amounts.promotion_discount}</span></div>
+            <div class="price-row"><span>优惠券</span><span style="color:#fed7d7">-¥${o.amounts.coupon_discount}</span></div>
+            <div class="price-row"><span>运费</span><span>¥${o.amounts.shipping_fee}</span></div>
+            <div class="price-row total"><span>实付</span><span>¥${o.amounts.paid_amount||o.amounts.order_amount}</span></div>
+        </div>
+        <h4 style="font-size:13px;margin-bottom:8px">状态流转</h4>
+        <div style="max-height:150px;overflow-y:auto">${logsHtml}</div>
+    `;
+    openModal('order-detail-modal');
+}
+
+async function payOrder(id) {
+    const res = await fetch(`/api/orders/${id}/pay`, {method:'POST'});
+    if (res.ok) { showToast('支付成功'); loadOrders(); loadProducts(); }
+    else { const d=await res.json(); showToast(d.detail||'失败','error'); }
+}
+
+async function cancelOrder(id) {
+    if (!confirm('确定取消该订单?')) return;
+    const res = await fetch(`/api/orders/${id}/cancel`, {method:'POST'});
+    if (res.ok) { showToast('已取消'); loadOrders(); loadProducts(); }
+    else { const d=await res.json(); showToast(d.detail||'失败','error'); }
+}
+
+async function completeOrder(id) {
+    const res = await fetch(`/api/orders/${id}/complete`, {method:'POST'});
+    if (res.ok) { showToast('订单已完成'); loadOrders(); }
+    else { const d=await res.json(); showToast(d.detail||'失败','error'); }
+}
+
+async function cutoff() {
+    if (!confirm('对今日所有已支付订单执行截单?')) return;
+    const res = await fetch('/api/warehouse/cutoff', {method:'POST'});
+    const d = await res.json();
+    showToast(d.message || (res.ok?'成功':'失败'), res.ok?'success':'error');
+    loadOrders();
+}
+
+function openAfterSale(orderId) {
+    showToast('请进入订单详情操作售后', 'success');
+    showOrderDetail(orderId);
+}
+
+init();
+</script>
+{% endblock %}

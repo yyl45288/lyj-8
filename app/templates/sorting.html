@@ -1,0 +1,227 @@
+{% extends "base.html" %}
+{% block content %}
+<div class="page-header">
+    <h2>分拣中心</h2>
+    <p>按订单分货、商品分拣、合单到自提点</p>
+</div>
+
+<div class="card">
+    <div class="card-header">
+        <h3>📦 分拣任务</h3>
+        <div style="display:flex;gap:8px">
+            <select id="filter-leader" onchange="loadTasks()" style="padding:4px 8px;border-radius:4px;border:1px solid #cbd5e0">
+                <option value="">全部团长</option>
+            </select>
+            <select id="filter-sorting-status" onchange="loadTasks()" style="padding:4px 8px;border-radius:4px;border:1px solid #cbd5e0">
+                <option value="">全部状态</option>
+                <option value="pending">待分拣</option>
+                <option value="in_progress">分拣中</option>
+                <option value="completed">已完成</option>
+            </select>
+            <button class="btn btn-primary btn-sm" onclick="loadTasks()">🔄 刷新</button>
+        </div>
+    </div>
+    <div class="card-body">
+        <div id="task-stats" style="margin-bottom:20px"></div>
+        <div id="task-list"></div>
+    </div>
+</div>
+
+<div class="modal-overlay" id="sorting-modal">
+    <div class="modal" style="max-width:700px">
+        <div class="modal-header">
+            <h3 id="sorting-modal-title">分拣操作</h3>
+            <button class="modal-close" onclick="closeModal('sorting-modal')">&times;</button>
+        </div>
+        <div class="modal-body" id="sorting-modal-content"></div>
+    </div>
+</div>
+
+<script>
+async function init() {
+    await loadLeaders();
+    loadTasks();
+}
+
+async function loadLeaders() {
+    const res = await fetch('/api/leaders');
+    const data = await res.json();
+    const sel = document.getElementById('filter-leader');
+    sel.innerHTML = '<option value="">全部团长</option>' +
+        data.data.map(l => `<option value="${l.id}">${l.name} - ${l.district}</option>`).join('');
+}
+
+async function loadTasks() {
+    const leader = document.getElementById('filter-leader').value;
+    const status = document.getElementById('filter-sorting-status').value;
+    let url = '/api/sorting/tasks';
+    const params = new URLSearchParams();
+    if (leader) params.set('leader_id', leader);
+    if (status) params.set('status', status);
+    if (params.toString()) url += '?' + params.toString();
+
+    const res = await fetch(url);
+    const data = await res.json();
+    renderStats(data.data);
+    renderTasks(data.data);
+}
+
+function renderStats(tasks) {
+    const byStatus = {pending:0, in_progress:0, completed:0};
+    let totalItems = 0, sortedItems = 0;
+    tasks.forEach(t => {
+        byStatus[t.status] = (byStatus[t.status] || 0) + 1;
+        totalItems += t.total_items;
+        sortedItems += t.sorted_items;
+    });
+    const pct = totalItems>0 ? Math.round(sortedItems/totalItems*100) : 0;
+    document.getElementById('task-stats').innerHTML = `
+        <div class="stats-grid" style="grid-template-columns:repeat(4,1fr);gap:12px;margin-bottom:12px">
+            <div class="stat-card" style="box-shadow:none;padding:0;background:#fff5f5">
+                <div class="stat-label">待分拣</div>
+                <div class="stat-value" style="color:#e53e3e">${byStatus.pending}</div>
+            </div>
+            <div class="stat-card" style="box-shadow:none;padding:0;background:#fffaf0">
+                <div class="stat-label">分拣中</div>
+                <div class="stat-value" style="color:#ed8936">${byStatus.in_progress}</div>
+            </div>
+            <div class="stat-card" style="box-shadow:none;padding:0;background:#f0fff4">
+                <div class="stat-label">已完成</div>
+                <div class="stat-value" style="color:#38a169">${byStatus.completed}</div>
+            </div>
+            <div class="stat-card" style="box-shadow:none;padding:0;background:#ebf8ff">
+                <div class="stat-label">总进度</div>
+                <div class="stat-value" style="color:#3182ce">${pct}%</div>
+            </div>
+        </div>
+        <div style="display:flex;gap:12px;align-items:center;font-size:12px;color:#718096">
+            <span>商品件数: ${sortedItems}/${totalItems}</span>
+            <div class="progress-bar" style="flex:1;height:8px"><div class="progress-fill" style="width:${pct}%"></div></div>
+        </div>
+    `;
+}
+
+function renderTasks(tasks) {
+    const el = document.getElementById('task-list');
+    if (!tasks.length) {
+        el.innerHTML = '<p style="color:#a0aec0;text-align:center;padding:30px">暂无分拣任务，请先截单</p>';
+        return;
+    }
+    el.innerHTML = tasks.map(t => {
+        const statusCls = {pending:'badge-gray', in_progress:'badge-orange', completed:'badge-green'}[t.status];
+        const canStart = t.status === 'pending';
+        const canComplete = t.status === 'in_progress' && t.progress >= 100;
+        const canOperate = t.status !== 'completed';
+        return `<div class="card" style="margin-bottom:12px">
+            <div class="card-header" style="padding:10px 16px">
+                <div>
+                    <strong>${t.leader_name}</strong>
+                    <span class="badge badge-purple" style="margin-left:8px">${t.order_no}</span>
+                    <span class="badge ${statusCls}" style="margin-left:4px">${t.status_text}</span>
+                </div>
+                <div style="display:flex;gap:6px;align-items:center">
+                    <span style="font-size:12px;color:#718096;margin-right:8px">
+                        ${t.sorted_items}/${t.total_items}件 ${t.progress}%
+                    </span>
+                    ${canStart ? `<button class="btn btn-success btn-sm" onclick="startSorting(${t.id})">开始分拣</button>`:''}
+                    ${canOperate ? `<button class="btn btn-primary btn-sm" onclick="openSorting(${t.id})">操作</button>`:''}
+                    ${canComplete ? `<button class="btn btn-warning btn-sm" onclick="completeSorting(${t.id})">完成</button>`:''}
+                </div>
+            </div>
+            <div class="card-body" style="padding:12px 16px">
+                <div style="font-size:12px;color:#718096;margin-bottom:8px">
+                    📍 ${t.leader_address}
+                    ${t.operator ? ` | 分拣员: ${t.operator}`:''}
+                    ${t.started_at ? ` | 开始: ${t.started_at.slice(5,16)}`:''}
+                    ${t.completed_at ? ` | 完成: ${t.completed_at.slice(5,16)}`:''}
+                </div>
+                <div class="progress-bar" style="height:4px;margin-bottom:8px">
+                    <div class="progress-fill" style="width:${t.progress}%"></div>
+                </div>
+                <div style="display:flex;flex-wrap:wrap;gap:6px">
+                    ${t.items.map(it => {
+                        const pct = it.required_qty>0 ? Math.round(it.sorted_qty/it.required_qty*100) : 0;
+                        const doneCls = it.is_complete ? 'tag green' : (it.sorted_qty>0 ? 'tag orange' : 'tag');
+                        return `<span class="${doneCls}">${it.product_name} ${it.sorted_qty}/${it.required_qty}</span>`;
+                    }).join('')}
+                </div>
+            </div>
+        </div>`;
+    }).join('');
+}
+
+async function startSorting(taskId) {
+    const res = await fetch(`/api/sorting/tasks/${taskId}/start`, {method:'POST'});
+    if (res.ok) { showToast('分拣已开始'); loadTasks(); }
+    else { const d=await res.json(); showToast(d.detail||'失败','error'); }
+}
+
+async function completeSorting(taskId) {
+    const res = await fetch(`/api/sorting/tasks/${taskId}/complete`, {method:'POST'});
+    if (res.ok) { showToast('分拣已完成'); loadTasks(); }
+    else { const d=await res.json(); showToast(d.detail||'失败','error'); }
+}
+
+async function openSorting(taskId) {
+    const leader = document.getElementById('filter-leader').value;
+    const status = document.getElementById('filter-sorting-status').value;
+    let url = '/api/sorting/tasks';
+    const params = new URLSearchParams();
+    if (leader) params.set('leader_id', leader);
+    if (status) params.set('status', status);
+    if (params.toString()) url += '?' + params.toString();
+    const res = await fetch(url);
+    const data = await res.json();
+    const task = data.data.find(t => t.id === taskId);
+    if (!task) return;
+
+    document.getElementById('sorting-modal-title').textContent = `分拣 - ${task.leader_name} (${task.order_no})`;
+
+    const itemsHtml = task.items.map(it => {
+        const remaining = it.required_qty - it.sorted_qty;
+        const disabled = it.is_complete || task.status === 'completed';
+        return `<div class="product-item">
+            <div class="product-info">
+                <div class="product-name">${it.product_name}</div>
+                <div class="product-meta">
+                    <span class="tag ${it.is_complete?'green':(it.sorted_qty>0?'orange':'')}">
+                        ${it.sorted_qty}/${it.required_qty}
+                    </span>
+                    剩余 ${remaining} 件
+                </div>
+            </div>
+            <div class="qty-control">
+                <button class="qty-btn" onclick="sortItem(${taskId},${it.id},-1)" ${disabled?'disabled style="opacity:0.5"':''}>-</button>
+                <input type="text" class="qty-input" value="${it.sorted_qty}" readonly style="background:${it.is_complete?'#c6f6d5':'#fff'}">
+                <button class="qty-btn" onclick="sortItem(${taskId},${it.id},1)" ${disabled?'disabled style="opacity:0.5"':''}>+</button>
+                ${remaining>0 ? `<button class="btn btn-success btn-sm" onclick="sortItem(${taskId},${it.id},${remaining})" ${disabled?'disabled style="opacity:0.5"':''}>全部</button>` : ''}
+            </div>
+        </div>`;
+    }).join('');
+
+    document.getElementById('sorting-modal-content').innerHTML = `
+        <div style="margin-bottom:12px">
+            <div style="margin-bottom:6px;display:flex;justify-content:space-between;font-size:13px">
+                <span>总体进度: ${task.progress}%</span>
+                <span>${task.sorted_items}/${task.total_items} 件</span>
+            </div>
+            <div class="progress-bar"><div class="progress-fill" style="width:${task.progress}%"></div></div>
+        </div>
+        ${itemsHtml}
+        <div style="margin-top:16px;display:flex;gap:8px">
+            ${task.status !== 'completed' ? `<button class="btn btn-success" style="flex:1" onclick="completeSorting(${taskId});closeModal('sorting-modal')">✅ 确认分拣完成</button>`:''}
+            <button class="btn btn-secondary" onclick="closeModal('sorting-modal')">关闭</button>
+        </div>
+    `;
+    openModal('sorting-modal');
+}
+
+async function sortItem(taskId, itemId, qty) {
+    const res = await fetch(`/api/sorting/tasks/${taskId}/items/${itemId}/sort?qty=${qty}`, {method:'POST'});
+    if (res.ok) { loadTasks(); openSorting(taskId); }
+    else { const d=await res.json(); showToast(d.detail||'失败','error'); }
+}
+
+init();
+</script>
+{% endblock %}

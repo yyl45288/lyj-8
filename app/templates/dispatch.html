@@ -1,0 +1,276 @@
+{% extends "base.html" %}
+{% block content %}
+<div class="page-header">
+    <h2>配送调度</h2>
+    <p>智能合单、车辆调度、路线规划、站点配送管理</p>
+</div>
+
+<div class="card">
+    <div class="card-header">
+        <h3>🚛 调度中心</h3>
+        <div style="display:flex;gap:8px">
+            <span id="summary-badge" class="badge badge-blue">加载中</span>
+            <select id="dispatch-strategy" style="padding:4px 8px;border-radius:4px;border:1px solid #cbd5e0">
+                <option value="district">按区域分组</option>
+                <option value="leader">按团长合单</option>
+            </select>
+            <button class="btn btn-primary btn-sm" onclick="createRoutes()">🗺️ 生成路线</button>
+            <button class="btn btn-secondary btn-sm" onclick="loadAll()">🔄 刷新</button>
+        </div>
+    </div>
+    <div class="card-body">
+        <div id="dispatch-summary" style="margin-bottom:20px"></div>
+    </div>
+</div>
+
+<div class="card">
+    <div class="card-header">
+        <h3>📋 配送路线</h3>
+        <select id="route-status" onchange="loadRoutes()" style="padding:4px 8px;border-radius:4px;border:1px solid #cbd5e0">
+            <option value="">全部状态</option>
+            <option value="pending">待发车</option>
+            <option value="dispatched">已发车</option>
+            <option value="in_transit">配送中</option>
+            <option value="arrived">已完成</option>
+        </select>
+    </div>
+    <div class="card-body">
+        <div id="routes-list"></div>
+    </div>
+</div>
+
+<div class="modal-overlay" id="route-modal">
+    <div class="modal" style="max-width:700px">
+        <div class="modal-header">
+            <h3 id="route-modal-title">路线详情</h3>
+            <button class="modal-close" onclick="closeModal('route-modal')">&times;</button>
+        </div>
+        <div class="modal-body" id="route-modal-content"></div>
+    </div>
+</div>
+
+<script>
+const statusLabels = {
+    pending: {text:'待发车', cls:'badge-yellow'},
+    dispatched: {text:'已发车', cls:'badge-blue'},
+    in_transit: {text:'配送中', cls:'badge-blue'},
+    arrived: {text:'已完成', cls:'badge-green'}
+};
+
+async function loadAll() {
+    await Promise.all([loadSummary(), loadRoutes()]);
+}
+
+async function loadSummary() {
+    const res = await fetch('/api/dispatch/summary');
+    const data = await res.json();
+    const d = data.data;
+    document.getElementById('summary-badge').textContent = '配送日:' + d.warehouse_date;
+    const v = d.vehicles || {};
+    const routeStats = d.routes_by_status || {};
+    const vByStatus = v.by_status || {};
+    document.getElementById('dispatch-summary').innerHTML = `
+        <div class="stats-grid" style="grid-template-columns:repeat(5,1fr);gap:12px;margin-bottom:16px">
+            <div><div style="font-size:12px;color:#718096">待配送订单</div><div style="font-size:24px;font-weight:700;color:#e53e3e">${d.ready_orders||0}</div></div>
+            <div><div style="font-size:12px;color:#718096">配送路线</div><div style="font-size:24px;font-weight:700;color:#3182ce">${d.total_routes||0}</div></div>
+            <div><div style="font-size:12px;color:#718096">总站点</div><div style="font-size:24px;font-weight:700;color:#805ad5">${d.total_stops||0}</div></div>
+            <div><div style="font-size:12px;color:#718096">订单数</div><div style="font-size:24px;font-weight:700;color:#38a169">${d.total_orders_in_routes||0}</div></div>
+            <div><div style="font-size:12px;color:#718096">总货量(m³)</div><div style="font-size:24px;font-weight:700;color:#ed8936">${d.total_volume||0}</div></div>
+        </div>
+        <div style="display:grid;grid-template-columns:1fr 1fr;gap:20px">
+            <div>
+                <h4 style="font-size:12px;color:#4a5568;margin-bottom:8px">路线状态分布</h4>
+                <div style="display:flex;flex-wrap:wrap;gap:6px">
+                    ${Object.entries(routeStats).map(([k,v]) => {
+                        const s = statusLabels[k] || {text:k, cls:'badge-gray'};
+                        return `<span class="badge ${s.cls}">${s.text}: ${v}</span>`;
+                    }).join('') || '<span style="color:#a0aec0;font-size:12px">暂无路线</span>'}
+                </div>
+            </div>
+            <div>
+                <h4 style="font-size:12px;color:#4a5568;margin-bottom:8px">车辆状态 (共${v.total||0}辆)</h4>
+                <div style="display:flex;flex-wrap:wrap;gap:6px">
+                    ${Object.entries(vByStatus).map(([k,v]) => {
+                        const map = {idle:['空闲','badge-green'],loading:['装车中','badge-yellow'],delivering:['配送中','badge-blue'],maintenance:['维护','badge-red']};
+                        const [txt, cls] = map[k] || [k,'badge-gray'];
+                        return `<span class="badge ${cls}">${txt}: ${v}</span>`;
+                    }).join('')}
+                </div>
+            </div>
+        </div>
+    `;
+}
+
+async function loadRoutes() {
+    const status = document.getElementById('route-status').value;
+    let url = '/api/dispatch/routes';
+    if (status) url += '?status=' + status;
+    const res = await fetch(url);
+    const data = await res.json();
+    const el = document.getElementById('routes-list');
+    if (!data.data.length) {
+        el.innerHTML = '<p style="color:#a0aec0;text-align:center;padding:30px">暂无配送路线，请先完成分拣后生成路线</p>';
+        return;
+    }
+    el.innerHTML = data.data.map(r => {
+        const s = statusLabels[r.status] || {text:r.status, cls:'badge-gray'};
+        return `<div class="card" style="margin-bottom:12px">
+            <div class="card-header" style="padding:12px 16px">
+                <div>
+                    <strong style="font-size:15px">${r.route_name}</strong>
+                    <span class="badge ${s.cls}" style="margin-left:8px">${s.text}</span>
+                    <span class="badge badge-purple" style="margin-left:4px">${r.warehouse_date}</span>
+                </div>
+                <div style="display:flex;gap:6px;align-items:center">
+                    <span style="font-size:12px;color:#718096;margin-right:8px">
+                        🚚 ${r.vehicle_plate} | 👤 ${r.driver} | 📦 ${r.total_orders}单 | 🛑 ${r.total_stops}站 | 📏 ${r.estimated_distance_km}km
+                    </span>
+                    <button class="btn btn-primary btn-sm" onclick="showRoute(${r.id})">详情</button>
+                    ${r.status==='pending' ? `<button class="btn btn-success btn-sm" onclick="dispatchRoute(${r.id})">发车</button>`:''}
+                </div>
+            </div>
+        </div>`;
+    }).join('');
+}
+
+async function createRoutes() {
+    const strategy = document.getElementById('dispatch-strategy').value;
+    if (!confirm('将对所有已完成分拣的订单生成配送路线?')) return;
+    const res = await fetch(`/api/dispatch/routes?strategy=${strategy}`, {method:'POST'});
+    const d = await res.json();
+    showToast(d.message || (res.ok?'成功':'失败'), res.ok?'success':'error');
+    if (res.ok) loadAll();
+}
+
+async function dispatchRoute(routeId) {
+    if (!confirm('确认发车?')) return;
+    const res = await fetch(`/api/dispatch/routes/${routeId}/dispatch`, {method:'POST'});
+    if (res.ok) { showToast('发车成功'); loadAll(); showRoute(routeId); }
+    else { const d=await res.json(); showToast(d.detail||'失败','error'); }
+}
+
+async function showRoute(routeId) {
+    const res = await fetch(`/api/dispatch/routes/${routeId}`);
+    const data = await res.json();
+    const r = data.data;
+    if (!r) return showToast('路线不存在','error');
+    const s = statusLabels[r.status];
+    document.getElementById('route-modal-title').textContent = r.route_name;
+
+    const doneCount = r.stops.filter(s => s.arrived_at).length;
+    const totalCount = r.stops.length;
+    const progressPct = totalCount>0 ? Math.round(doneCount/totalCount*100) : 0;
+
+    let stopsHtml = '';
+    let stopSeqMap = {};
+    r.stops.forEach(st => {
+        if (!stopSeqMap[st.sequence]) stopSeqMap[st.sequence] = [];
+        stopSeqMap[st.sequence].push(st);
+    });
+
+    const mergedStops = Object.entries(stopSeqMap).map(([seq, list]) => {
+        const first = list[0];
+        const allArrived = list.every(s => s.arrived_at);
+        const allDeparted = list.every(s => s.departed_at);
+        let statusCls = '';
+        if (allDeparted) statusCls = 'done';
+        else if (allArrived) statusCls = 'current';
+        const ordersStr = list.map(s => s.orders.map(o =>
+            `<div style="font-size:11px;padding:2px 0"><span class="badge badge-gray">${o.order_no}</span> ${o.items.join(', ')}</div>`
+        ).join('');
+        const actions = [];
+        if (!allArrived && (r.status==='dispatched' || r.status==='in_transit')) {
+            actions.push(`<button class="btn btn-success btn-sm" onclick="stopArrive(${first.id})">到达</button>`);
+        } else if (allArrived && !allDeparted) {
+            actions.push(`<button class="btn btn-warning btn-sm" onclick="stopDepart(${first.id})">离开</button>`);
+        }
+        return `<div class="route-stop ${statusCls}">
+            <div class="stop-header">
+                <div>
+                    <strong>站点${seq}: ${first.stop_name}</strong>
+                    <div style="font-size:11px;color:#718096;margin-top:2px">${first.stop_address}</div>
+                    ${ordersStr}
+                </div>
+                <div style="text-align:right">
+                    <div style="font-size:12px;color:#718096;margin-bottom:4px">
+                        ${list.length}单 · ${list.reduce((a,b)=>a+b.volume,0)}m³
+                    </div>
+                    <div style="display:flex;gap:4px;justify-content:flex-end">${actions.join(' ')}</div>
+                </div>
+            </div>
+        </div>`;
+    }).join('');
+
+    document.getElementById('route-modal-content').innerHTML = `
+        <div style="margin-bottom:16px">
+            <div style="display:grid;grid-template-columns:repeat(4,1fr);gap:8px;margin-bottom:12px">
+                <div style="background:#f7fafc;padding:8px;border-radius:4px;text-align:center">
+                    <div style="font-size:11px;color:#718096">车辆</div>
+                    <div style="font-weight:600;font-size:13px">${r.vehicle?.plate_no||'-'}</div>
+                    <div style="font-size:11px;color:#718096">${r.vehicle?.driver||''} ${r.vehicle?.phone||''}</div>
+                </div>
+                <div style="background:#f7fafc;padding:8px;border-radius:4px;text-align:center">
+                    <div style="font-size:11px;color:#718096">站点进度</div>
+                    <div style="font-weight:600;font-size:16px;color:#3182ce">${doneCount}/${totalCount}</div>
+                    <div style="font-size:11px;color:#718096">${progressPct}%</div>
+                </div>
+                <div style="background:#f7fafc;padding:8px;border-radius:4px;text-align:center">
+                    <div style="font-size:11px;color:#718096">距离/时间</div>
+                    <div style="font-weight:600;font-size:13px">${r.stats.estimated_distance_km}km</div>
+                    <div style="font-size:11px;color:#718096">约${r.stats.estimated_duration_min}分钟</div>
+                </div>
+                <div style="background:#f7fafc;padding:8px;border-radius:4px;text-align:center">
+                    <div style="font-size:11px;color:#718096">订单/货量</div>
+                    <div style="font-weight:600;font-size:13px">${r.stats.total_orders}单</div>
+                    <div style="font-size:11px;color:#718096">${r.stats.total_volume}m³</div>
+                </div>
+            </div>
+            <div class="progress-bar" style="height:6px;margin-bottom:8px">
+                <div class="progress-fill" style="width:${progressPct}%"></div>
+            </div>
+        </div>
+        <div style="margin-bottom:12px">
+            <div style="font-size:11px;color:#718096;margin-bottom:8px">
+                🕐 发车: ${r.timestamps.dispatched_at?.slice(5,16)||'未发车'}
+                ${r.timestamps.arrived_at? ` | 完成: ${r.timestamps.arrived_at.slice(5,16)}`:''}
+            </div>
+        </div>
+        <h4 style="font-size:13px;margin-bottom:10px;color:#4a5568">配送站点 (${r.vehicle?.plate_no||''})</h4>
+        <div style="max-height:350px;overflow-y:auto;padding:4px 0">
+            <div class="route-stop done" style="border-left-color:#38a169">
+                <div class="stop-header">
+                    <div><strong>🏭 仓库(起点)</strong></div>
+                    <div><span class="badge badge-green">已出发</span></div>
+                </div>
+            </div>
+            ${mergedStops}
+            <div class="route-stop ${r.status==='arrived'?'done':''}" style="border-left-color:#38a169">
+                <div class="stop-header">
+                    <div><strong>🏭 仓库(终点)</strong></div>
+                    <div><span class="badge ${r.status==='arrived'?'badge-green':'badge-gray'}">${r.status==='arrived'?'已返回':'待返回'}</span></div>
+                </div>
+            </div>
+        </div>
+        <div style="margin-top:16px;display:flex;gap:8px">
+            ${r.status==='pending' ? `<button class="btn btn-success" style="flex:1" onclick="dispatchRoute(${r.id});closeModal('route-modal')">🚚 确认发车</button>`:''}
+            <button class="btn btn-secondary" onclick="loadAll();closeModal('route-modal')">关闭</button>
+        </div>
+    `;
+    openModal('route-modal');
+}
+
+async function stopArrive(stopId) {
+    const res = await fetch(`/api/dispatch/stops/${stopId}/arrive`, {method:'POST'});
+    if (res.ok) { showToast('站点已到达'); loadRoutes(); setTimeout(()=>location.reload(),500); }
+    else { const d=await res.json(); showToast(d.detail||'失败','error'); }
+}
+
+async function stopDepart(stopId) {
+    const res = await fetch(`/api/dispatch/stops/${stopId}/depart`, {method:'POST'});
+    if (res.ok) { showToast('站点已离开'); loadRoutes(); setTimeout(()=>location.reload(),500); }
+    else { const d=await res.json(); showToast(d.detail||'失败','error'); }
+}
+
+loadAll();
+</script>
+{% endblock %}
